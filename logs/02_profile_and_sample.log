@@ -1,0 +1,113 @@
+2026-11-22 20:53:35 | INFO    | 02_profile_and_sample | Loading index (18 columns) ...
+2026-11-22 20:53:35 | INFO    | 02_profile_and_sample | Loaded 3,861 chunks from 16 videos
+2026-11-22 20:53:35 | INFO    | 02_profile_and_sample | Slug labels: {'2d': 2.5999999046325684, '3d': 0.800000011920929, 'unknown': 18.0}
+2026-11-22 20:53:35 | INFO    | 02_profile_and_sample | Fetching YouTube metadata for 3 videos (0 cached) ...
+2026-11-22 20:53:38 | INFO    | 02_profile_and_sample | After YouTube enrichment: {'2d': 2.5999999046325684, '3d': 0.800000011920929, 'unknown': 18.0}
+2026-11-22 20:53:38 | INFO    | 02_profile_and_sample | 2D pool before activity filter: 477 chunks, 2.7 h
+2026-11-22 20:53:38 | INFO    | 02_profile_and_sample | Activity filter (move>0.20 in >=15% frames AND buttons in >=8% frames): kept 93.3% (477 -> 445 chunks)
+2026-11-22 20:53:38 | INFO    | 02_profile_and_sample | Sampling bounds: alpha=0 -> 0.0 h (1 chunk/game), alpha=1 -> 2.5 h (everything)
+2026-11-22 20:53:38 | INFO    | 02_profile_and_sample | Solved alpha=0.91045 -> 1.5 h (target 1.5 h)
+2026-11-22 20:53:38 | INFO    | 02_profile_and_sample | split train             games=   2 videos=    2 chunks=    270 hours=    1.5
+2026-11-22 20:53:38 | INFO    | 02_profile_and_sample | Wrote /tmp/ng_test/manifest_2d.parquet (270 chunks, 1.5 h). Reports in /tmp/ng_test/reports
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Raw parquet schema detected in stage 01 (SHARD_0000):
+back: int32
+dpad_down: int32
+dpad_left: int32
+dpad_right: int32
+dpad_up: int32
+east: int32
+guide: int32
+left_shoulder: int32
+left_thumb: int32
+left_trigger: int32
+north: int32
+right_shoulder: int32
+right_thumb: int32
+right_trigger: int32
+south: int32
+start: int32
+west: int32
+j_left: list<element: double>
+  child 0, element: double
+j_right: list<element: int64>
+  child 0, element: int64
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Stick layout: {"j_left": {"mode": "list", "cols": ["j_left"]}, "j_right": {"mode": "list", "cols": ["j_right"]}} | missing buttons: [] | extra cols: []
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | metadata.json keys: ['bbox_controller_overlay', 'chunk_id', 'chunk_size', 'controller_type', 'game', 'original_video', 'uuid'] | original_video keys: ['duration', 'end_frame', 'end_time', 'resolution', 'source', 'start_frame', 'start_time', 'url', 'video_id']
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Index schema:
+uuid: string
+chunk_dir: string
+shard: int16
+video_id: string
+chunk_id: int32
+chunk_size: int32
+n_frames: int32
+fps: float
+start_time: double
+end_time: double
+duration: float
+start_frame: int64
+end_frame: int64
+res_h: int32
+res_w: int32
+source: string
+url: string
+game: string
+controller_type: string
+bbox_controller_overlay: string
+bbox_game_area: string
+bbox_others: string
+has_processed: bool
+action_source: string
+frac_lstick_01: float
+frac_lstick_02: float
+frac_lstick_03: float
+frac_rstick_02: float
+frac_btn_gameplay: float
+frac_btn_any: float
+mean_btn_per_frame: float
+frac_any_input: float
+meta_json: string
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Sample index rows:
+                                                                   0                                            1                                            2
+uuid                                  0TZC693ZPRU_chunk_0021_actions               0TZC693ZPRU_chunk_0026_actions               0TZC693ZPRU_chunk_0019_actions
+chunk_dir                                     0TZC693ZPRU_chunk_0021                       0TZC693ZPRU_chunk_0026                       0TZC693ZPRU_chunk_0019
+shard                                                              0                                            0                                            0
+video_id                                                 0TZC693ZPRU                                  0TZC693ZPRU                                  0TZC693ZPRU
+chunk_id                                                          21                                           26                                           19
+chunk_size                                                       600                                          600                                          600
+n_frames                                                         600                                          600                                          600
+fps                                                             30.0                                         30.0                                         30.0
+start_time                                                     420.0                                        520.0                                        380.0
+end_time                                                       440.0                                        540.0                                        400.0
+duration                                                        20.0                                         20.0                                         20.0
+start_frame                                                    12600                                        15600                                        11400
+end_frame                                                      13199                                        16199                                        11999
+res_h                                                            720                                          720                                          720
+res_w                                                           1280                                         1280                                         1280
+source                                                       youtube                                      youtube                                      youtube
+url                      https://www.youtube.com/watch?v=0TZC693ZPRU  https://www.youtube.com/watch?v=0TZC693ZPRU  https://www.youtube.com/watch?v=0TZC693ZPRU
+game                                                           other                                        other                         
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | actions[0TZC693ZPRU_chunk_0021_actions]: shape=(600, 21) sticks∈[-0.80, 0.81] buttons∈[0.0, 1.0] source=raw
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | actions[0TZC693ZPRU_chunk_0026_actions]: shape=(600, 21) sticks∈[-0.82, 0.83] buttons∈[0.0, 1.0] source=raw
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | actions[0TZC693ZPRU_chunk_0019_actions]: shape=(600, 21) sticks∈[-0.85, 0.86] buttons∈[0.0, 1.0] source=raw
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Loading index (18 columns) ...
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Loaded 3,861 chunks from 16 videos
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Slug labels: {'2d': 20.899999618530273, '3d': 0.6000000238418579}
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | 2D pool before activity filter: 3,755 chunks, 20.9 h
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Activity filter (move>0.20 in >=15% frames AND buttons in >=8% frames): kept 72.5% (3,755 -> 2,721 chunks)
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Sampling bounds: alpha=0 -> 0.0 h (1 chunk/game), alpha=1 -> 15.1 h (everything)
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Solved alpha=0.77580 -> 3.0 h (target 3.0 h)
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | split train             games=   4 videos=   14 chunks=    505 hours=    2.8
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | split val_unseen_games  games=   1 videos=    1 chunks=     35 hours=    0.2
+2026-11-22 20:59:38 | INFO    | 02_profile_and_sample | Wrote /tmp/ng_test/manifest_2d.parquet (540 chunks, 3.0 h). Reports in /tmp/ng_test/reports
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | Loading index (18 columns) ...
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | Loaded 3,861 chunks from 16 videos
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | fps filter [30.0, 60.0] -> 3,861 chunks
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | Slug labels: {'3d': 1.399999976158142, 'unknown': 20.0}
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | LLM labels (/tmp/ng_test/llm_game_labels.parquet): applied to 4 videos (conf>=0.60) -> {'2d': 7.0, '3d': 6.199999809265137, 'unknown': 8.199999809265137}
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | 2D pool before activity filter: 1,268 chunks, 7.0 h
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | Activity filter (move>0.20 in >=15% frames AND buttons in >=8% frames): kept 62.1% (1,268 -> 788 chunks)
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | Sampling bounds: alpha=0 -> 0.0 h (1 chunk/game), alpha=1 -> 4.4 h (everything)
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | Solved alpha=0.93708 -> 3.0 h (target 3.0 h)
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | split train             games=   2 videos=    2 chunks=    540 hours=    3.0
+2026-11-22 21:19:42 | INFO    | 02_profile_and_sample | Wrote /tmp/ng_test/manifest_llm.parquet (540 chunks, 3.0 h). Reports in /tmp/ng_test/reports_llm

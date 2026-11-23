@@ -1,0 +1,26 @@
+# Core pipeline (stages 01-03, 05, verify). Python 3.10-3.12 recommended (vLLM compatibility).
+# System deps: ffmpeg/ffprobe on PATH, and a JS runtime for yt-dlp's YouTube extractor (deno recommended).
+huggingface_hub>=0.26
+hf_xet>=1.0             # fast HF downloads (Xet storage backend)
+pyarrow>=16
+pandas>=2.1
+numpy>=1.26
+scipy>=1.11
+pyyaml>=6
+tqdm>=4.66
+yt-dlp>=2025.11.12      # keep this current: `pip install -U yt-dlp` when YouTube breaks things
+opencv-python-headless>=4.9
+Pillow>=10
+av>=12                  # PyAV: mp4 decode in stage 04 fallback / 05 npy mode / verify
+webdataset>=0.2.86
+
+# Stage 04 captioning (install on the GPU box). Pick one backend:
+#   vLLM (recommended, fastest batched offline inference):
+vllm>=0.7.2
+#   or HF transformers:
+transformers>=4.49
+accelerate>=0.34
+torch>=2.4
+#   or any OpenAI-compatible endpoint:
+openai>=1.40
+# flash-attn            # optional, speeds up the transformers backend

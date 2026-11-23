@@ -1,0 +1,3 @@
+# Manual game labels (highest precedence). game = NitroGen slug or title (matching is normalized).
+# is_2d: 1/0 (or yes/no). genre is optional. Fill from data/reports/game_label_report.csv.
+game,is_2d,genre

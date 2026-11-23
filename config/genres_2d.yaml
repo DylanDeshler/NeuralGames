@@ -1,0 +1,379 @@
+# 2D game whitelist / 3D blacklist used by 02_profile_and_sample.py
+#
+# Matching is done on a normalized form (lowercase, alphanumerics only), so
+# "Hollow Knight: Silksong", "hollow_knight__silksong" and "HOLLOW KNIGHT SILKSONG" all match.
+# NitroGen's `game` field is a snake_case slug and is "other" for a large share of videos; for
+# those, the YouTube title/tags are matched against these titles (see --enrich-youtube).
+#
+# Precedence: config/game_labels.csv (manual)  >  exclude_3d  >  games_2d  >  YouTube match  >  keywords
+# Extend freely. Run stage 02 once; it writes data/reports/game_label_report.csv listing the
+# unlabeled games with the most hours — label those in config/game_labels.csv and re-run.
+
+genres_2d:
+  - Platformer
+  - Metroidvania
+  - Run and Gun
+  - Beat 'em up
+  - Arcade
+  - 2D Action
+
+games_2d:
+  Metroidvania:
+    - Hollow Knight
+    - "Hollow Knight: Silksong"
+    - Ori and the Blind Forest
+    - Ori and the Will of the Wisps
+    - Blasphemous
+    - Blasphemous 2
+    - Dead Cells
+    - Bloodstained Ritual of the Night
+    - "Bloodstained: Curse of the Moon"
+    - "Bloodstained: Curse of the Moon 2"
+    - Castlevania Symphony of the Night
+    - Castlevania Aria of Sorrow
+    - Castlevania Dawn of Sorrow
+    - Axiom Verge
+    - Axiom Verge 2
+    - Ender Lilies
+    - "Ender Lilies: Quietus of the Knights"
+    - "Ender Magnolia: Bloom in the Mist"
+    - Afterimage
+    - Prince of Persia The Lost Crown
+    - "Prince of Persia: The Lost Crown"
+    - Nine Sols
+    - Grime
+    - Salt and Sanctuary
+    - Salt and Sacrifice
+    - Death's Gambit
+    - "Death's Gambit: Afterlife"
+    - Timespinner
+    - Guacamelee
+    - Guacamelee 2
+    - Monster Boy and the Cursed Kingdom
+    - Aeterna Noctis
+    - Ghost Song
+    - Islets
+    - Haiku the Robot
+    - Momodora Reverie Under the Moonlight
+    - "Momodora: Moonlit Farewell"
+    - The Messenger
+    - Sundered
+    - Valfaris
+    - Gato Roboto
+    - Rabi-Ribi
+    - Indivisible
+    - Vigil The Longest Night
+    - Elderand
+    - Moonscars
+    - Mandragora
+    - The Last Faith
+    - Biomorph
+    - Constance
+    - Metroid Dread
+    - Super Metroid
+    - Metroid Fusion
+    - Metroid Zero Mission
+    - Metroid Samus Returns
+  Platformer:
+    - Celeste
+    - Cuphead
+    - "Cuphead: The Delicious Last Course"
+    - Shovel Knight
+    - "Shovel Knight: Treasure Trove"
+    - Shovel Knight Dig
+    - Super Meat Boy
+    - Super Meat Boy Forever
+    - Rayman Legends
+    - Rayman Origins
+    - Super Mario Bros Wonder
+    - Super Mario Bros
+    - Super Mario Bros 3
+    - Super Mario World
+    - New Super Mario Bros
+    - New Super Mario Bros Wii
+    - New Super Mario Bros U Deluxe
+    - Super Mario Maker 2
+    - Donkey Kong Country
+    - Donkey Kong Country 2
+    - Donkey Kong Country Returns
+    - Donkey Kong Country Tropical Freeze
+    - Sonic Mania
+    - Sonic Superstars
+    - Sonic the Hedgehog
+    - Sonic the Hedgehog 2
+    - Sonic the Hedgehog 3
+    - Sonic 3 and Knuckles
+    - Kirby's Return to Dream Land
+    - Kirby's Return to Dream Land Deluxe
+    - Kirby Star Allies
+    - Kirby Planet Robobot
+    - Kirby Triple Deluxe
+    - Mega Man 11
+    - Mega Man X
+    - Mega Man X2
+    - Mega Man X3
+    - Mega Man 2
+    - Mega Man Legacy Collection
+    - Mega Man X Legacy Collection
+    - Mega Man Zero
+    - Mega Man ZX
+    - Pizza Tower
+    - Spelunky
+    - Spelunky 2
+    - Terraria
+    - Rogue Legacy
+    - Rogue Legacy 2
+    - Owlboy
+    - Limbo
+    - Inside
+    - Little Nightmares  # NOTE: 2.5D side-view
+    - Trine
+    - Trine 2
+    - Trine 4
+    - Trine 5
+    - Unravel
+    - Unravel Two
+    - Gris
+    - Neon Abyss
+    - Dust An Elysian Tail
+    - Kunai
+    - Pepper Grinder
+    - Venture Kid
+    - Shantae
+    - "Shantae: Half-Genie Hero"
+    - "Shantae and the Seven Sirens"
+    - "Shantae and the Pirate's Curse"
+    - "Shantae: Risky's Revenge"
+    - Wonder Boy The Dragon's Trap
+    - Mighty No 9
+    - Freedom Planet
+    - Freedom Planet 2
+    - Bread and Fred
+    - Pico Park
+    - Ultimate Chicken Horse
+    - Super Bunny Man
+    - Jump King
+    - Getting Over It
+    - Geometry Dash
+    - The End Is Nigh
+    - Dandara
+    - Teslagrad
+    - Teslagrad 2
+    - Fez
+    - Braid
+    - Mark of the Ninja
+    - Katana Zero
+    - Rain World
+    - Noita
+    - Broforce
+    - "Oddworld: Abe's Oddysee"
+    - Aggelos
+    - Cave Story
+    - Ninja Gaiden Ragebound
+  Run and Gun:
+    - Metal Slug
+    - Metal Slug 2
+    - Metal Slug 3
+    - Metal Slug X
+    - Metal Slug 4
+    - Metal Slug 5
+    - Metal Slug Anthology
+    - Contra
+    - "Contra: Operation Galuga"
+    - Contra III The Alien Wars
+    - Contra Hard Corps
+    - Contra Anniversary Collection
+    - Blazing Chrome
+    - Gunstar Heroes
+    - Iron Meat
+    - Huntdown
+    - Cyber Shadow
+    - Mercenary Kings
+    - Enter the Gungeon  # NOTE: top-down
+    - Nuclear Throne      # NOTE: top-down
+  Beat 'em up:
+    - "Teenage Mutant Ninja Turtles: Shredder's Revenge"
+    - TMNT Shredder's Revenge
+    - Streets of Rage 4
+    - Streets of Rage 2
+    - Streets of Rage
+    - Castle Crashers
+    - River City Girls
+    - River City Girls 2
+    - River City Ransom
+    - "Double Dragon Gaiden: Rise of the Dragons"
+    - Double Dragon
+    - Final Fight
+    - Scott Pilgrim vs The World The Game
+    - "Scott Pilgrim vs. the World: The Game"
+    - Fight'N Rage
+    - Mother Russia Bleeds
+    - Dragon's Crown
+    - Dragon's Crown Pro
+    - "Marvel Cosmic Invasion"
+    - "Absolum"
+    - "Battletoads"
+    - "Ninja Saviors: Return of the Warriors"
+  Arcade:
+    - Galaga
+    - Pac-Man
+    - Pac-Man Championship Edition 2
+    - Pac-Man 99
+    - Tetris
+    - Tetris Effect
+    - Tetris 99
+    - Puyo Puyo Tetris
+    - Puyo Puyo Tetris 2
+    - Space Invaders
+    - Ikaruga
+    - DoDonPachi
+    - Touhou
+    - Sky Force Reloaded
+    - Steredenn
+    - Jamestown
+    - Galak-Z
+    - Downwell
+    - Vampire Survivors  # NOTE: top-down
+    - Brotato            # NOTE: top-down
+    - Geometry Wars
+    - Galaxian
+    - Bubble Bobble
+  2D Action:
+    - Hyper Light Drifter   # top-down
+    - Children of Morta     # top-down
+    - Moonlighter           # top-down
+    - Skul The Hero Slayer
+    - "Skul: The Hero Slayer"
+    - Hotline Miami
+    - Hotline Miami 2
+    - Katana Zero
+    # 2D-plane fighting games (delete this block if you don't want fighters)
+    - Street Fighter 6
+    - Street Fighter V
+    - Street Fighter III 3rd Strike
+    - Street Fighter II
+    - Guilty Gear Strive
+    - Guilty Gear Xrd
+    - BlazBlue Central Fiction
+    - "BlazBlue: Cross Tag Battle"
+    - Dragon Ball FighterZ
+    - Mortal Kombat 1
+    - Mortal Kombat 11
+    - Skullgirls
+    - "Skullgirls 2nd Encore"
+    - Brawlhalla
+    - Rivals of Aether
+    - Rivals of Aether 2
+    - Super Smash Bros Ultimate
+    - Super Smash Bros Melee
+    - Nidhogg
+    - Nidhogg 2
+    - Towerfall Ascension
+    - Duck Game
+    - Stardew Valley  # top-down sim; remove if not wanted
+    - Undertale
+    - Deltarune
+    - "The Binding of Isaac: Rebirth"  # top-down
+    - "The Binding of Isaac"
+    - Enter the Gungeon
+
+# Titles that must never be included, even if YouTube tags look 2D (3D or 2.5D-camera games).
+exclude_3d:
+  - Risk of Rain 2
+  - Risk of Rain Returns  # remove this line if you want RoR Returns (2D remake)
+  - Returnal
+  - Only Up
+  - Sonic Frontiers
+  - Gunfire Reborn
+  - Death's Door
+  - Curse of the Dead Gods
+  - Sifu
+  - Tekken 8
+  - Tekken 7
+  - Elden Ring
+  - Dark Souls
+  - Dark Souls II
+  - Dark Souls III
+  - Sekiro Shadows Die Twice
+  - Bloodborne
+  - Lies of P
+  - Ghost of Tsushima
+  - God of War
+  - God of War Ragnarok
+  - Hogwarts Legacy
+  - Cyberpunk 2077
+  - Red Dead Redemption 2
+  - Grand Theft Auto V
+  - Minecraft
+  - Fortnite
+  - Fall Guys
+  - "Fall Guys: Ultimate Knockout"
+  - Rocket League
+  - Genshin Impact
+  - Honkai Star Rail
+  - Wuthering Waves
+  - Black Myth Wukong
+  - Devil May Cry 5
+  - Bayonetta
+  - Monster Hunter World
+  - Monster Hunter Rise
+  - Monster Hunter Wilds
+  - The Legend of Zelda Breath of the Wild
+  - The Legend of Zelda Tears of the Kingdom
+  - Super Mario Odyssey
+  - Astro Bot
+  - Crash Bandicoot
+  - Spyro
+  - Hades  # isometric 3D render; remove to include
+  - Hades II
+  - Brutal Bastion
+  - MX Bikes
+  - Forza Horizon 5
+  - Gran Turismo 7
+  - Mario Kart 8 Deluxe
+  - Apex Legends
+  - Call of Duty
+
+# Weak evidence used only when --keyword-fallback is set and the video's game cannot be
+# identified. Matches YouTube title/tags/description (normalized, whole-word).
+keywords_2d:
+  - platformer
+  - metroidvania
+  - run and gun
+  - beat em up
+  - beat 'em up
+  - side scroller
+  - sidescroller
+  - side-scrolling
+  - 2d action
+  - pixel art
+  - 16 bit
+  - shmup
+  - bullet hell
+keywords_3d:
+  - 3d
+  - open world
+  - fps
+  - first person
+  - third person
+  - souls-like
+  - soulslike
+  - battle royale
+
+# Abbreviations / alternate names seen in YouTube titles -> canonical title (must exist in games_2d
+# or exclude_3d). Aliases are matched as whole words, even when short.
+aliases:
+  Castlevania Symphony of the Night: [sotn, symphony of the night]
+  The Binding of Isaac: [isaac repentance, binding of isaac, tboi, isaac rebirth, isaac afterbirth]
+  Celeste: [strawberry jam collab]
+  Hollow Knight: [pantheon of hallownest, hallownest]
+  "Hollow Knight: Silksong": [silksong]
+  "Teenage Mutant Ninja Turtles: Shredder's Revenge": [tmnt shredders revenge, shredder's revenge]
+  Ori and the Will of the Wisps: [ori wotw]
+  Super Mario Bros Wonder: [mario wonder]
+  Bloodstained Ritual of the Night: [ritual of the night]
+  Elden Ring: [shadow of the erdtree]
+
+# Titles that are ordinary English words: only accepted when the YouTube title STARTS with them.
+ambiguous_titles: [Inside, Limbo, Braid, Grime, Gris, Islets, Unravel, Afterimage, Indivisible,
+                   Sundered, Kunai, Constance, Mandragora, Contra, Jamestown, Biomorph, Noita]

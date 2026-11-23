@@ -1,0 +1,2 @@
+2026-11-22 21:00:29 | INFO    | 05_pack_webdataset | [train] 8 samples, 0.0 h, 4 shards -> /tmp/ng_test/wds/train | dropped {'not_processed': 497, 'no_caption': 0, 'vlm_3d': 0, 'dark': 0, 'bad_shape': 0}
+2026-11-22 21:00:29 | INFO    | 05_pack_webdataset | [val_unseen_games] 3 samples, 0.0 h, 2 shards -> /tmp/ng_test/wds/val_unseen_games | dropped {'not_processed': 32, 'no_caption': 0, 'vlm_3d': 0, 'dark': 0, 'bad_shape': 0}
