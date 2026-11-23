@@ -201,7 +201,7 @@ def main():
     ap.add_argument("--backend", choices=["vllm", "transformers", "openai"], default="vllm")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--image-size", type=int, default=448, help="upscale the 256px frame's long side to this")
+    ap.add_argument("--image-size", type=int, default=448, help="upscale the (bucket-res) frame's long side to this")
     ap.add_argument("--max-pixels", type=int, default=512 * 28 * 28)
     ap.add_argument("--max-new-tokens", type=int, default=160)
     ap.add_argument("--max-model-len", type=int, default=4096)

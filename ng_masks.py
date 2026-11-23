@@ -1,0 +1,92 @@
+"""Loss / conditioning masks for training on the packed WebDataset samples.
+
+Each sample's JSON carries, in output-pixel coordinates (width x height = the clip's aspect bucket):
+  pad = [px, py], content_wh = [w, h]    letterbox geometry (game content rectangle)
+  inpaint_boxes = [[x, y, w, h], ...]     regions inpainted in stage 03 (controller overlay, webcams, ...),
+                                          already dilated by --mask-dilate px
+
+Recommended use (see README "Overlay masking"):
+  * the model never sees overlay pixels: they were removed before encoding (stage 03 inpainting);
+  * don't supervise inpainted pixels or letterbox bars: multiply the per-element loss by `valid`;
+  * optionally feed `1 - valid` (latent resolution) as an extra input channel, add random fake boxes to
+    ~10-20% of samples with `augment_fake_boxes`, and pass an all-valid mask at inference.
+
+numpy-only, and works with any framework (torch.from_numpy on the outputs).
+"""
+from __future__ import annotations
+
+import numpy as np
+
+
+def pixel_valid_mask(info: dict, mask_letterbox: bool = True, mask_inpainted: bool = True,
+                     extra_dilate: int = 0) -> np.ndarray:
+    """(H, W) float32, 1 = supervise this pixel, 0 = ignore (inpainted overlay / pad bars in 'fit' clips)."""
+    W, H = int(info["width"]), int(info["height"])
+    valid = np.ones((H, W), np.float32)
+    if mask_letterbox:
+        px, py = info.get("pad", [0, 0])
+        cw, ch = info.get("content_wh", [W, H])
+        valid[:] = 0
+        valid[py:py + ch, px:px + cw] = 1
+    if mask_inpainted:
+        for x, y, w, h in info.get("inpaint_boxes") or []:
+            x0, y0 = max(0, x - extra_dilate), max(0, y - extra_dilate)
+            x1, y1 = min(W, x + w + extra_dilate), min(H, y + h + extra_dilate)
+            valid[y0:y1, x0:x1] = 0
+    return valid
+
+
+def grid_valid_mask(valid_px: np.ndarray, stride: int, halo: int = 0) -> np.ndarray:
+    """Downsample a pixel mask to a grid of `stride`-px cells (latent cells, or patches for pixel-space
+    models like JiT: stride = patch size gives a per-token mask, e.g. to drop fully-masked tokens).
+
+    A latent cell is valid only if ALL of its pixels are valid (conservative: any touched cell is
+    masked). `halo` additionally masks that many neighbouring cells, which covers the VAE encoder's
+    receptive-field bleed if you ever encode frames that still contain overlay pixels.
+    """
+    H, W = valid_px.shape
+    gh, gw = H // stride, W // stride
+    cells = valid_px[: gh * stride, : gw * stride].reshape(gh, stride, gw, stride).min(axis=(1, 3))
+    if halo > 0:
+        inv = cells < 0.5
+        grown = inv.copy()
+        for dy in range(-halo, halo + 1):
+            for dx in range(-halo, halo + 1):
+                grown |= np.roll(np.roll(inv, dy, 0), dx, 1) & _shift_ok(gh, gw, dy, dx)
+        cells = (~grown).astype(np.float32)
+    return cells.astype(np.float32)
+
+
+def _shift_ok(gh: int, gw: int, dy: int, dx: int) -> np.ndarray:
+    """Mask out wrap-around from np.roll."""
+    ok = np.ones((gh, gw), bool)
+    if dy > 0:
+        ok[:dy] = False
+    elif dy < 0:
+        ok[dy:] = False
+    if dx > 0:
+        ok[:, :dx] = False
+    elif dx < 0:
+        ok[:, dx:] = False
+    return ok
+
+
+def augment_fake_boxes(valid: np.ndarray, rng: np.random.Generator, p: float = 0.15, max_boxes: int = 2,
+                       min_frac: float = 0.03, max_frac: float = 0.12) -> np.ndarray:
+    """With prob p, zero out 1..max_boxes random rectangles (each min_frac..max_frac of the area).
+
+    Use on the *conditioning* mask channel (and blank the same region in the context frames) so the model
+    learns "masked = unknown" in general rather than "masked = where overlays live".
+    """
+    if rng.random() >= p:
+        return valid
+    v = valid.copy()
+    H, W = v.shape
+    for _ in range(rng.integers(1, max_boxes + 1)):
+        area = rng.uniform(min_frac, max_frac) * H * W
+        ar = rng.uniform(0.6, 1.6)
+        h = int(np.clip(np.sqrt(area / ar), 2, H))
+        w = int(np.clip(area / max(h, 1), 2, W))
+        y, x = rng.integers(0, H - h + 1), rng.integers(0, W - w + 1)
+        v[y:y + h, x:x + w] = 0
+    return v

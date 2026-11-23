@@ -59,6 +59,7 @@ INDEX_SCHEMA = pa.schema([
     ("bbox_controller_overlay", pa.string()), ("bbox_game_area", pa.string()), ("bbox_others", pa.string()),
     ("has_processed", pa.bool_()), ("action_source", pa.string()),
     ("frac_lstick_01", pa.float32()), ("frac_lstick_02", pa.float32()), ("frac_lstick_03", pa.float32()),
+    ("frac_move_01", pa.float32()), ("frac_move_02", pa.float32()), ("frac_move_03", pa.float32()),  # stick OR d-pad
     ("frac_rstick_02", pa.float32()), ("frac_btn_gameplay", pa.float32()), ("frac_btn_any", pa.float32()),
     ("mean_btn_per_frame", pa.float32()), ("frac_any_input", pa.float32()),
     ("meta_json", pa.string()),

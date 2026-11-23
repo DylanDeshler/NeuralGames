@@ -16,7 +16,7 @@ import pandas as pd
 import yaml
 from tqdm import tqdm
 
-from ng_common import norm_title
+from ng_common import norm_title, norm_words
 
 UNAVAILABLE_PATTERNS = re.compile(
     r"(private video|video unavailable|has been removed|no longer available|account associated|"
@@ -29,6 +29,10 @@ UNAVAILABLE_PATTERNS = re.compile(
 class GameLabeler:
     def __init__(self, cfg_path: Path, labels_csv: Path | None):
         cfg = yaml.safe_load(cfg_path.read_text())
+        bad = [t for v in (cfg.get("games_2d") or {}).values() for t in (v or []) if not isinstance(t, str)]
+        bad += [t for t in (cfg.get("exclude_3d") or []) if not isinstance(t, str)]
+        if bad:
+            raise ValueError(f"{cfg_path}: non-string titles (quote titles containing ':'): {bad}")
         self.title_2d: dict[str, tuple[str, str]] = {}  # norm -> (display, genre)
         for genre, titles in (cfg.get("games_2d") or {}).items():
             for t in titles or []:
@@ -50,7 +54,7 @@ class GameLabeler:
             items = []
             for key, val in d.items():
                 disp = val[0] if isinstance(val, tuple) else val
-                words = re.sub(r"[^a-z0-9]+", " ", disp.lower().replace("&", "and")).split()
+                words = norm_words(disp)
                 if words:
                     items.append((" " + " ".join(words) + " ", key))
             return sorted(items, key=lambda x: -len(x[0]))
@@ -63,11 +67,14 @@ class GameLabeler:
             if status is None:
                 continue
             for a in alist or []:
-                words = re.sub(r"[^a-z0-9]+", " ", a.lower().replace("&", "and")).split()
+                words = norm_words(a)
                 if words:
                     self.alias_phr.append((" " + " ".join(words) + " ", status, k))
         self.alias_phr.sort(key=lambda x: -len(x[0]))
         self.ambiguous = {norm_title(t) for t in cfg.get("ambiguous_titles") or []}
+        # titles that should count as ONE game for grouping / unseen-game holdout
+        self.group_of = {norm_title(t): norm_title(canon) for canon, ts in (cfg.get("game_groups") or {}).items()
+                         for t in [canon, *(ts or [])]}
 
     def label_slug(self, game: str):
         """-> (status in {'2d','3d','unknown'}, genre, source)"""
@@ -79,11 +86,28 @@ class GameLabeler:
             return "3d", "", "exclude_3d"
         if k in self.title_2d:
             return "2d", self.title_2d[k][1], "whitelist"
+        # slug contains a known title/alias as a phrase: 'the_binding_of_isaac__repentance' -> Isaac,
+        # 'dark_souls__remastered' -> Dark Souls, 'super_mario_world_2__yoshi_s_island' -> SMW
+        if game and game != "other":
+            hit = self.match_text(game.replace("_", " "))
+            if hit:
+                if hit[0] == "2d":
+                    return "2d", self.title_2d[hit[1]][1], "slug_match"
+                return "3d", "", "slug_match"
         return "unknown", "", ""
+
+    def canonical_key(self, game: str) -> str:
+        """Game key used for grouping/holdout: the matched curated title if the slug contains one,
+        then collapsed through `game_groups` (e.g. Isaac Rebirth/Repentance -> one game)."""
+        k = norm_title(game)
+        if not (k in self.manual or k in self.title_2d or k in self.title_3d or not game or game == "other"):
+            hit = self.match_text(game.replace("_", " "))
+            k = hit[1] if hit else k
+        return self.group_of.get(k, k)
 
     def match_text(self, text: str):
         """Find the longest known title (2D or 3D) mentioned in a YouTube title/tags string."""
-        t = " " + " ".join(re.sub(r"[^a-z0-9]+", " ", (text or "").lower().replace("&", "and")).split()) + " "
+        t = " " + " ".join(norm_words(text)) + " "
         best = None
         for phr, status, key in self.alias_phr:
             if phr in t:

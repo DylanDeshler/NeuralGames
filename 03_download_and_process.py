@@ -1,9 +1,14 @@
 #!/usr/bin/env python
-"""Stage 03 — fetch exactly the 20 s window of each manifest chunk, crop/letterbox to 256x256,
-inpaint the controller overlay, and save frames + aligned (T, 21) float32 actions.
+"""Stage 03 — fetch exactly the 20 s window of each manifest chunk, resize it into an aspect-ratio
+bucket (no letterboxing), inpaint the controller overlay, and save frames + aligned (T, 21) float32 actions.
+
+Geometry: crop bbox_game_area -> decode at analysis res -> detect static black pillar/letterbox bars
+(e.g. a 4:3 game inside a 16:9 video) -> pick the bucket (in --patch units, ~256 tokens by default) with
+the closest aspect -> resize to cover it and centre-crop the small excess (<= --max-crop, typically 1-2%),
+so there's no distortion and no bars. Clips with unusual aspect ratios fall back to fit+pad (recorded in pad/content_wh).
 
 Per chunk output (data/processed/<video_id>/<uuid>/):
-    frames.mp4    256x256 H.264 yuv444p (CRF 10 by default), exactly T frames at --target-fps (default 30)
+    frames.mp4    W x H (bucket, e.g. 336x192 for 16:9) H.264 yuv444p CRF 10, exactly T frames at --target-fps
     actions.npy   (T, 21) float32 [j_left_x, j_left_y, j_right_x, j_right_y, 17 buttons], pooled to the
                   output fps (sticks: mean over the stride window, buttons: OR) so short taps survive
     frame0.png    first (inpainted) frame, used by the captioner
@@ -160,108 +165,223 @@ def _jload(s):
 
 
 # ============================================================================ geometry
-def plan_geometry(row, src_w: int, src_h: int, size: int, mask_others: bool, dilate: int) -> dict:
-    """Compute crop (source px), letterbox scale/pad, and the inpainting mask in output space."""
-    meta_h, meta_w = int(row.res_h or src_h), int(row.res_w or src_w)
-    sx, sy = src_w / meta_w, src_h / meta_h
+# Aspect-ratio buckets in PATCH units (W x H). "auto" = canonical buckets fitted to common game aspect
+# ratios (~256 tokens at --patch 16, JiT-style), plus filler buckets so that EVERY aspect in
+# [0.5, 2.45] is within --max-crop of some bucket (no clip ever needs padding):
+#   21x12 16:9 (crop 1.6%) | 19x14 4:3 (1.8%) | 17x15 8:7 SNES/NES (0.8%) | 18x12 3:2 GBA (0%)
+#   19x12 16:10 (1.0%) | 16x16 1:1 | 24x10 21:9 (1.2%) | 14x19 3:4 | 12x21 9:16
+CANONICAL_BUCKETS = "21x12,19x14,17x15,18x12,19x12,16x16,24x10,14x19,12x21"
+DEFAULT_BUCKETS = "auto"
+
+
+def parse_buckets(spec: str) -> list[tuple[int, int]]:
+    out = []
+    for b in spec.split(","):
+        w, h = b.lower().strip().split("x")
+        out.append((int(w), int(h)))
+    return out
+
+
+def auto_buckets(canonical: str, max_crop: float, tokens: int = 256, lo: float = 0.5, hi: float = 2.45,
+                 tol: float = 0.12) -> list[tuple[int, int]]:
+    """Canonical buckets + greedy gap filling until every aspect in [lo, hi] is within max_crop."""
+    buckets = parse_buckets(canonical)
+    cands = [(w, h) for w in range(4, 64) for h in range(4, 64) if tokens * (1 - tol) <= w * h <= tokens * (1 + tol / 2)]
+    grid = np.exp(np.linspace(np.log(lo), np.log(hi), 4000))
+    for _ in range(64):
+        t = np.array([w / h for w, h in buckets])
+        worst = (1 - np.minimum(grid[:, None] / t, t / grid[:, None])).min(1)
+        if worst.max() <= max_crop:
+            break
+        a = grid[int(np.argmax(worst))]  # least-covered aspect -> add the candidate closest to it
+        buckets.append(min(cands, key=lambda c: (abs(np.log(c[0] / c[1] / a)), abs(c[0] * c[1] - tokens))))
+    return sorted(set(buckets), key=lambda b: b[0] / b[1])
+
+
+def source_crop(row, src_w: int, src_h: int) -> tuple[int, int, int, int]:
+    """bbox_game_area (relative) -> (x0, y0, w, h) in source pixels, even dims; full frame if absent."""
     ga = _jload(row.bbox_game_area)
     if isinstance(ga, dict) and all(k in ga for k in ("xtl", "ytl", "xbr", "ybr")):
-        x0, y0 = int(round(ga["xtl"] * src_w)), int(round(ga["ytl"] * src_h))
-        x1, y1 = int(round(ga["xbr"] * src_w)), int(round(ga["ybr"] * src_h))
-        x0, y0 = max(0, x0), max(0, y0)
-        x1, y1 = min(src_w, max(x1, x0 + 16)), min(src_h, max(y1, y0 + 16))
+        x0, y0 = max(0, int(round(ga["xtl"] * src_w))), max(0, int(round(ga["ytl"] * src_h)))
+        x1 = min(src_w, max(int(round(ga["xbr"] * src_w)), x0 + 16))
+        y1 = min(src_h, max(int(round(ga["ybr"] * src_h)), y0 + 16))
     else:
         x0, y0, x1, y1 = 0, 0, src_w, src_h
-    cw, ch = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
-    s = min(size / cw, size / ch)
-    nw, nh = max(2, int(round(cw * s))), max(2, int(round(ch * s)))
-    px, py = (size - nw) // 2, (size - nh) // 2
+    return x0, y0, (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
 
-    boxes_src = []  # (x, y, w, h) in source pixels
+
+def analysis_dims(cw: int, ch: int, max_dim: int) -> tuple[int, int]:
+    s = min(1.0, max_dim / max(cw, ch))
+    return max(2, int(round(cw * s / 2)) * 2), max(2, int(round(ch * s / 2)) * 2)
+
+
+def _run_len(mask: np.ndarray) -> int:
+    """Number of leading True values."""
+    idx = np.flatnonzero(~mask)
+    return int(idx[0]) if len(idx) else len(mask)
+
+
+def detect_borders(frames: list[np.ndarray], thresh: float, min_frac: float = 0.02,
+                   sym_tol: float = 0.03) -> tuple[int, int, int, int]:
+    """Static black bars (pillar/letterbox inside the video) -> (left, top, right, bottom) in px.
+
+    A column/row is border if its 99th-percentile brightness, maxed over time, stays below `thresh`.
+    Bars must be roughly symmetric (they're centred) and leave >= 50% of the axis, otherwise that axis
+    is left alone; this protects dark game scenes from being cropped.
+    """
+    sample = frames[:: max(1, len(frames) // 32)]
+    m = np.max(np.stack([f.max(axis=2) for f in sample]), axis=0).astype(np.float32)  # (h, w) max over time
+    h, w = m.shape
+    col_dark = np.percentile(m, 99, axis=0) < thresh
+    row_dark = np.percentile(m, 99, axis=1) < thresh
+    L, R = _run_len(col_dark), _run_len(col_dark[::-1])
+    T, B = _run_len(row_dark), _run_len(row_dark[::-1])
+    if not (min(L, R) >= min_frac * w and abs(L - R) <= sym_tol * w + 2 and w - L - R >= 0.5 * w):
+        L = R = 0
+    if not (min(T, B) >= min_frac * h and abs(T - B) <= sym_tol * h + 2 and h - T - B >= 0.5 * h):
+        T = B = 0
+    return L, T, R, B
+
+
+def choose_bucket(cw: int, ch: int, buckets: list[tuple[int, int]], patch: int, max_crop: float) -> dict:
+    """Pick the bucket with the least aspect mismatch (ties -> more tokens).
+
+    cover: scale to cover the bucket and centre-crop the (<= max_crop) excess, so there's no distortion and no bars
+    fit:   if no bucket is within max_crop, scale to fit and pad (black bars, recorded as pad/content_wh)
+    """
+    a = cw / ch
+    best = min(buckets, key=lambda b: (1 - min(a / (b[0] / b[1]), (b[0] / b[1]) / a), -b[0] * b[1]))
+    W, H = best[0] * patch, best[1] * patch
+    t = W / H
+    crop = 1 - min(a / t, t / a)
+    if crop <= max_crop:
+        s = max(W / cw, H / ch)
+        rw, rh = max(W, int(round(cw * s))), max(H, int(round(ch * s)))
+        return {"mode": "cover", "W": W, "H": H, "bucket": f"{best[0]}x{best[1]}", "rw": rw, "rh": rh,
+                "ox": -((rw - W) // 2), "oy": -((rh - H) // 2), "pad": [0, 0], "content_wh": [W, H],
+                "crop_frac": crop}
+    s = min(W / cw, H / ch)
+    rw, rh = min(W, int(round(cw * s))), min(H, int(round(ch * s)))
+    px, py = (W - rw) // 2, (H - rh) // 2
+    return {"mode": "fit", "W": W, "H": H, "bucket": f"{best[0]}x{best[1]}", "rw": rw, "rh": rh,
+            "ox": px, "oy": py, "pad": [px, py], "content_wh": [rw, rh], "crop_frac": 0.0}
+
+
+def overlay_boxes_src(row, src_w: int, src_h: int, mask_others: bool) -> list[tuple[float, float, float, float]]:
+    """Controller overlay (+ bbox_others) as (x, y, w, h) in source pixels."""
+    meta_h, meta_w = int(row.res_h or src_h), int(row.res_w or src_w)
+    sx, sy = src_w / meta_w, src_h / meta_h
+    boxes = []
     ov = _jload(row.bbox_controller_overlay)
     if isinstance(ov, (list, tuple)) and len(ov) == 4 and all(v is not None for v in ov):
-        boxes_src.append((ov[0] * sx, ov[1] * sy, ov[2] * sx, ov[3] * sy))
+        boxes.append((ov[0] * sx, ov[1] * sy, ov[2] * sx, ov[3] * sy))
     if mask_others:
         for b in _jload(row.bbox_others) or []:
             if isinstance(b, dict) and all(k in b for k in ("xtl", "ytl", "xbr", "ybr")):
-                boxes_src.append((b["xtl"] * src_w, b["ytl"] * src_h,
-                                  (b["xbr"] - b["xtl"]) * src_w, (b["ybr"] - b["ytl"]) * src_h))
-    mask = np.zeros((size, size), np.uint8)
-    boxes_out = []
-    for bx, by, bw, bh in boxes_src:
-        ox0 = (bx - x0) * s + px - dilate
-        oy0 = (by - y0) * s + py - dilate
-        ox1 = (bx + bw - x0) * s + px + dilate
-        oy1 = (by + bh - y0) * s + py + dilate
-        ox0, oy0 = max(px, int(np.floor(ox0))), max(py, int(np.floor(oy0)))
-        ox1, oy1 = min(px + nw, int(np.ceil(ox1))), min(py + nh, int(np.ceil(oy1)))
-        if ox1 > ox0 and oy1 > oy0:
-            mask[oy0:oy1, ox0:ox1] = 255
-            boxes_out.append([ox0, oy0, ox1 - ox0, oy1 - oy0])
-    return {"crop": [x0, y0, cw, ch], "scale": s, "content_wh": [nw, nh], "pad": [px, py],
-            "mask": mask, "mask_boxes": boxes_out, "src_wh": [src_w, src_h],
-            "mask_frac": float((mask > 0).sum()) / max(1, nw * nh)}
+                boxes.append((b["xtl"] * src_w, b["ytl"] * src_h,
+                              (b["xbr"] - b["xtl"]) * src_w, (b["ybr"] - b["ytl"]) * src_h))
+    return boxes
 
 
-def vf_chain(geo: dict, fps: float, size: int) -> str:
-    x0, y0, cw, ch = geo["crop"]
-    nw, nh = geo["content_wh"]
+def build_mask(boxes_src, crop_src, ana_wh, borders, geo, dilate: int):
+    """Map source-px boxes through crop -> analysis scale -> border crop -> bucket resize/crop/pad."""
+    x0, y0, cw, ch = crop_src
+    aw, ah = ana_wh
+    L, T, R, B = borders
+    kx, ky = aw / cw, ah / ch                          # source -> analysis
+    fx, fy = geo["rw"] / (aw - L - R), geo["rh"] / (ah - T - B)  # analysis content -> resized
+    W, H = geo["W"], geo["H"]
     px, py = geo["pad"]
-    return (f"fps={fps:.6f},crop={cw}:{ch}:{x0}:{y0},scale={nw}:{nh}:flags=area,"
-            f"pad={size}:{size}:{px}:{py}:black,format=rgb24")
+    nw, nh = geo["content_wh"]
+    mask = np.zeros((H, W), np.uint8)
+    out = []
+    for bx, by, bw, bh in boxes_src:
+        def tx(x):
+            return ((x - x0) * kx - L) * fx + geo["ox"]
+
+        def ty(y):
+            return ((y - y0) * ky - T) * fy + geo["oy"]
+        X0, Y0 = max(px, int(np.floor(tx(bx) - dilate))), max(py, int(np.floor(ty(by) - dilate)))
+        X1, Y1 = min(px + nw, int(np.ceil(tx(bx + bw) + dilate))), min(py + nh, int(np.ceil(ty(by + bh) + dilate)))
+        if X1 > X0 and Y1 > Y0:
+            mask[Y0:Y1, X0:X1] = 255
+            out.append([X0, Y0, X1 - X0, Y1 - Y0])
+    return mask, out
+
+
+def warp(frame: np.ndarray, borders, geo) -> np.ndarray:
+    L, T, R, B = borders
+    h, w = frame.shape[:2]
+    content = frame[T:h - B, L:w - R]
+    r = cv2.resize(content, (geo["rw"], geo["rh"]), interpolation=cv2.INTER_AREA)
+    if geo["mode"] == "cover":
+        return np.ascontiguousarray(r[-geo["oy"]:-geo["oy"] + geo["H"], -geo["ox"]:-geo["ox"] + geo["W"]])
+    canvas = np.zeros((geo["H"], geo["W"], 3), np.uint8)
+    canvas[geo["oy"]:geo["oy"] + geo["rh"], geo["ox"]:geo["ox"] + geo["rw"]] = r
+    return canvas
 
 
 # ============================================================================ core processing
-def decode_process_encode(input_args: list[str], geo: dict, fps_out: float, n_out: int, size: int,
-                          out_mp4: Path, frame0_png: Path, args, tmp: Path) -> int:
-    """ffmpeg decode -> python inpaint -> ffmpeg encode. Returns the number of decoded frames."""
+def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], fps_out: float, n_out: int,
+                          out_mp4: Path, frame0_png: Path, args, tmp: Path) -> tuple[int, dict]:
+    """ffmpeg decode (crop game area, analysis-res) -> buffer -> detect bars -> choose bucket ->
+    resize/crop + inpaint in python -> ffmpeg encode. Returns (decoded_frames, geometry)."""
+    src_w, src_h = src_wh
+    crop_src = source_crop(row, src_w, src_h)
+    x0, y0, cw, ch = crop_src
+    aw, ah = analysis_dims(cw, ch, args.analysis_max_dim)
     dec_cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *input_args, "-an", "-sn",
-               "-vf", vf_chain(geo, fps_out, size), "-frames:v", str(n_out), "-f", "rawvideo",
-               "-pix_fmt", "rgb24", "pipe:1"]
+               "-vf", f"fps={fps_out:.6f},crop={cw}:{ch}:{x0}:{y0},scale={aw}:{ah}:flags=area,format=rgb24",
+               "-frames:v", str(n_out), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    with open(tmp / "dec.log", "wb") as dec_err:
+        dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=dec_err)
+        fbytes, frames = aw * ah * 3, []
+        try:
+            while len(frames) < n_out:
+                buf = dec.stdout.read(fbytes)
+                if len(buf) < fbytes:
+                    break
+                frames.append(np.frombuffer(buf, np.uint8).reshape(ah, aw, 3))
+        finally:
+            dec.stdout.close()
+            dec.kill()
+            dec.wait()
+    decoded = len(frames)
+    if decoded == 0 or n_out - decoded > args.max_pad_frames:
+        raise ShortClipError(f"only {decoded}/{n_out} frames decoded: {(tmp / 'dec.log').read_text()[-400:]}")
+    frames += [frames[-1]] * (n_out - decoded)  # tiny tail deficit (rounding at clip end): repeat last frame
+
+    borders = detect_borders(frames, args.border_thresh) if args.detect_borders else (0, 0, 0, 0)
+    L, T, R, B = borders
+    geo = choose_bucket(aw - L - R, ah - T - B, args.bucket_list, args.patch, args.max_crop)
+    mask, boxes = build_mask(overlay_boxes_src(row, src_w, src_h, args.mask_others), crop_src, (aw, ah),
+                             borders, geo, args.mask_dilate)
+    W, H = geo["W"], geo["H"]
     enc_cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
-               "-pix_fmt", "rgb24", "-s", f"{size}x{size}", "-r", f"{fps_out:.6f}", "-i", "pipe:0",
+               "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", f"{fps_out:.6f}", "-i", "pipe:0",
                "-c:v", args.vcodec, *args.enc_args.split(), "-g", str(args.gop), "-movflags", "+faststart",
                str(out_mp4)]
-    dec_err, enc_err = open(tmp / "dec.log", "wb"), open(tmp / "enc.log", "wb")
-    dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=dec_err)
-    enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stderr=enc_err)
-    fbytes = size * size * 3
-    mask = geo["mask"] if geo["mask"].any() else None
-    n, last = 0, None
-    try:
-        while n < n_out:
-            buf = dec.stdout.read(fbytes)
-            if len(buf) < fbytes:
-                break
-            frame = np.frombuffer(buf, np.uint8).reshape(size, size, 3)
-            if mask is not None:
-                frame = cv2.inpaint(frame, mask, args.inpaint_radius, cv2.INPAINT_TELEA)
-            if n == 0:
-                cv2.imwrite(str(frame0_png), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            enc.stdin.write(frame.tobytes())
-            last = frame
-            n += 1
-        decoded = n
-        if 0 < n_out - n <= args.max_pad_frames and last is not None:
-            for _ in range(n_out - n):  # tiny tail deficit (rounding at clip end): repeat last frame
-                enc.stdin.write(last.tobytes())
-                n += 1
-    finally:
+    with open(tmp / "enc.log", "wb") as enc_err:
+        enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stderr=enc_err)
         try:
-            enc.stdin.close()
-        except BrokenPipeError:
-            pass
-        dec.stdout.close()
-        dec.kill()
-        dec.wait()
-        enc.wait()
-        dec_err.close()
-        enc_err.close()
+            for i, f in enumerate(frames):
+                out = warp(f, borders, geo)
+                if boxes:
+                    out = cv2.inpaint(out, mask, args.inpaint_radius, cv2.INPAINT_TELEA)
+                if i == 0:
+                    cv2.imwrite(str(frame0_png), cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
+                enc.stdin.write(out.tobytes())
+        finally:
+            try:
+                enc.stdin.close()
+            except BrokenPipeError:
+                pass
+            enc.wait()
     if enc.returncode != 0:
         raise RuntimeError(f"encoder failed: {(tmp / 'enc.log').read_text()[-500:]}")
-    if n < n_out:
-        raise ShortClipError(f"only {decoded}/{n_out} frames decoded: {(tmp / 'dec.log').read_text()[-400:]}")
-    return decoded
+    geo.update(crop_src=list(crop_src), src_wh=[src_w, src_h], analysis_wh=[aw, ah], borders=list(borders),
+               inpaint_boxes=boxes, inpaint_frac=float((mask > 0).sum()) / max(1, W * H))
+    return decoded, geo
 
 
 def fps_stride(fps_ann: float, target: float) -> int | None:
@@ -318,7 +438,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
                     info = resolver.resolve(row.video_id, url, fmt, cap, limiter)
                     if not info.get("width") or not info.get("height"):
                         raise RuntimeError("stream dims unknown")
-                    geo = plan_geometry(row, info["width"], info["height"], args.size, args.mask_others, args.mask_dilate)
+                    src_wh = (info["width"], info["height"])
                     hdr = "".join(f"{k}: {v}\r\n" for k, v in (info.get("headers") or {}).items())
                     inp = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                            "-rw_timeout", "30000000", *(["-headers", hdr] if hdr else []),
@@ -330,10 +450,10 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
                     raw = download_section(url, fmt, start, start + dur + 0.5, tmp, args)
                     w, h = probe_dims(raw)
                     info = {"width": w, "height": h, "format_id": "sections"}
-                    geo = plan_geometry(row, w, h, args.size, args.mask_others, args.mask_dilate)
+                    src_wh = (w, h)
                     inp = ["-i", str(raw)]
-                decoded = decode_process_encode(inp, geo, fps_out, n_out, args.size, work / "frames.mp4",
-                                                work / "frame0.png", args, tmp)
+                decoded, geo = decode_process_encode(inp, row, src_wh, fps_out, n_out, work / "frames.mp4",
+                                                     work / "frame0.png", args, tmp)
                 method_used = method
                 break
             except PermanentError:
@@ -358,9 +478,11 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
             "n_frames": int(n_out), "fps": fps_out, "frame_stride": stride, "annotation_fps": fps_ann,
             "annotation_frames": n_ann,
             "start_time": start, "duration": dur, "action_names": ACTION_NAMES, "action_source": row.action_source,
-            "size": args.size, "crop_src": geo["crop"], "src_wh": geo["src_wh"], "scale": geo["scale"],
-            "pad": geo["pad"], "content_wh": geo["content_wh"], "inpaint_boxes": geo["mask_boxes"],
-            "inpaint_frac": geo["mask_frac"], "decoded_frames": int(decoded),
+            "width": geo["W"], "height": geo["H"], "bucket": geo["bucket"], "patch": args.patch,
+            "fit_mode": geo["mode"], "aspect_crop_frac": geo["crop_frac"], "pad": geo["pad"],
+            "content_wh": geo["content_wh"], "crop_src": geo["crop_src"], "src_wh": geo["src_wh"],
+            "analysis_wh": geo["analysis_wh"], "border_crop_ltrb": geo["borders"],
+            "inpaint_boxes": geo["inpaint_boxes"], "inpaint_frac": geo["inpaint_frac"], "decoded_frames": int(decoded),
             "padded_frames": int(n_out - decoded), "method": method_used, "format_id": info.get("format_id"),
             "vcodec": args.vcodec, "enc_args": args.enc_args, "original_metadata": orig,
             "processed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -372,7 +494,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
             os.replace(work / name, out_dir / name)
         os.replace(work / "meta.json", out_dir / "meta.json")
         src_actions.unlink(missing_ok=True)
-        return {"status": "ok", "method": method_used, "padded": n_out - decoded}
+        return {"status": "ok", "method": method_used, "padded": n_out - decoded, "bucket": geo["bucket"]}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -458,7 +580,17 @@ def main():
     ap.add_argument("--retry-failed", action="store_true", help="retry chunks marked permanently failed")
     ap.add_argument("--method", choices=["auto", "direct", "sections"], default="auto")
     ap.add_argument("--max-src-height", type=int, default=720, help="source resolution cap (1080 for small game areas)")
-    ap.add_argument("--size", type=int, default=256)
+    ap.add_argument("--patch", type=int, default=16, help="model patch size in px; buckets are in patch units")
+    ap.add_argument("--buckets", default=DEFAULT_BUCKETS,
+                    help="'auto' (canonical game aspects + gap fillers, ~256 tokens each) or an explicit "
+                         "list 'WxH,...' in patches, e.g. '21x12,19x14,16x16'")
+    ap.add_argument("--max-crop", type=float, default=0.05,
+                    help="max fraction of the content cropped to fill a bucket; beyond this, pad instead")
+    ap.add_argument("--detect-borders", action=argparse.BooleanOptionalAction, default=True,
+                    help="detect static black pillar/letterbox bars inside the video (4:3 game in a 16:9 video)")
+    ap.add_argument("--border-thresh", type=float, default=24.0, help="max brightness (0-255) of a bar")
+    ap.add_argument("--analysis-max-dim", type=int, default=0,
+                    help="intermediate decode size (long side); 0 = auto (>= 1.5x the largest bucket side)")
     ap.add_argument("--target-fps", type=float, default=30.0,
                     help="output fps (0 = native). Per-chunk integer stride: 60->30 keeps every 2nd frame, 30->30 "
                          "keeps all; actions pooled over each stride window (sticks mean, buttons OR)"),
@@ -480,7 +612,13 @@ def main():
     ap.add_argument("--status", action="store_true", help="print progress and exit")
     args = ap.parse_args()
 
+    args.bucket_list = (auto_buckets(CANONICAL_BUCKETS, args.max_crop) if args.buckets == "auto"
+                        else parse_buckets(args.buckets))
+    if not args.analysis_max_dim:
+        args.analysis_max_dim = max(512, int(1.5 * args.patch * max(max(b) for b in args.bucket_list)))
     log = setup_logging("03_download_and_process")
+    log.info("Buckets (patch %d): %s", args.patch,
+             ", ".join(f"{w}x{h}={w * args.patch}x{h * args.patch}" for w, h in args.bucket_list))
     for tool in ("ffmpeg", "ffprobe", "yt-dlp"):
         if shutil.which(tool) is None:
             raise SystemExit(f"'{tool}' not found on PATH")
@@ -520,6 +658,7 @@ def main():
     resolver, limiter = StreamResolver(args, log), RateLimiter(args.max_starts_per_min)
     flock = threading.Lock()
     stats = {"ok": 0, "permanent": 0, "transient": 0, "padded": 0}
+    buckets: dict[str, int] = {}
 
     def record_failure(row, kind, err):
         with flock, open(failed_path, "a") as fh:
@@ -566,10 +705,12 @@ def main():
                 if s in stats:
                     stats[s] += 1
                 stats["padded"] += int(res.get("padded", 0) > 0)
+                if res.get("bucket"):
+                    buckets[res["bucket"]] = buckets.get(res["bucket"], 0) + 1
                 pbar.update(1)
                 pbar.set_postfix(ok=stats["ok"], perm=stats["permanent"], fail=stats["transient"])
     pbar.close()
-    log.info("Done: %s", stats)
+    log.info("Done: %s | buckets: %s", stats, dict(sorted(buckets.items(), key=lambda kv: -kv[1])))
     print_status(man, args)
 
 

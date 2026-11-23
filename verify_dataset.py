@@ -5,13 +5,15 @@ Checks per sample:
   * required members present (video, actions.npy, txt, json, cls)
   * len(frames) == len(actions) == json.n_frames  (exact temporal alignment)
   * actions shape (T, 21) float32, sticks in [-1, 1], buttons in {0, 1}, no NaN/Inf
-  * frames uint8 in [0, 255], shape (T, 256, 256, 3), not all black, letterbox bars black
-  * caption non-empty; game_id consistent with game_ids.json
+  * frames uint8 in [0, 255], shape (T, H, W, 3) matching json width/height (patch-divisible), not all
+    black, pad bars black (fit-mode clips only)
+  * caption non-empty; game_id consistent with game_ids.json; inpaint_boxes present and inside the frame
 Global checks: no game appears in both train and val_unseen_games.
 
 Outputs (in --out-dir):
   grid_<split>.png          rows = samples, cols = evenly spaced frames with stick vectors and
-                            pressed buttons overlaid, caption under each row
+                            pressed buttons overlaid, inpainted (loss-masked) regions outlined in red,
+                            caption under each row
   debug_<split>_<key>.mp4   (with --debug-videos N) full clip with live action overlay — the best way
                             to eyeball whether stick motion matches on-screen motion
 
@@ -82,15 +84,25 @@ def check_sample(key: str, s: dict, game_ids: dict) -> tuple[list[str], dict]:
             errs.append("buttons not binary")
     if frames.dtype != np.uint8:
         errs.append(f"frames dtype {frames.dtype}")
-    if frames.ndim != 4 or frames.shape[1:] != (meta.get("size", 256), meta.get("size", 256), 3):
-        errs.append(f"frames shape {frames.shape}")
+    W, H = meta.get("width"), meta.get("height")
+    if frames.ndim != 4 or frames.shape[1:] != (H, W, 3):
+        errs.append(f"frames shape {frames.shape} != (T, {H}, {W}, 3) from json")
+    if meta.get("patch") and (W % meta["patch"] or H % meta["patch"]):
+        errs.append(f"{W}x{H} not divisible by patch {meta['patch']}")
     if frames.min() < 0 or frames.max() > 255:
         errs.append("frames out of [0,255]")
     if frames.max() < 10:
         errs.append("clip is entirely black")
     px, py = meta.get("pad", [0, 0])
-    if py > 2 and frames[:, : py - 2].mean() > 8:  # letterbox should be black (allow codec ringing)
-        errs.append(f"letterbox bars not black (mean {frames[:, :py - 2].mean():.1f})")
+    if py > 2 and frames[:, : py - 2].mean() > 8:  # padding (fit mode only) should be black (allow ringing)
+        errs.append(f"pad rows not black (mean {frames[:, :py - 2].mean():.1f})")
+    if px > 2 and frames[:, :, : px - 2].mean() > 8:
+        errs.append(f"pad columns not black (mean {frames[:, :, :px - 2].mean():.1f})")
+    if "inpaint_boxes" not in meta:
+        errs.append("json missing inpaint_boxes (repack with current 05_pack_webdataset.py)")
+    for b in meta.get("inpaint_boxes") or []:
+        if len(b) != 4 or b[2] <= 0 or b[3] <= 0 or b[0] < 0 or b[1] < 0 or b[0] + b[2] > W or b[1] + b[3] > H:
+            errs.append(f"bad inpaint box {b}")
     if not s["txt"].decode().strip():
         errs.append("empty caption")
     gk = meta.get("game_key")
@@ -100,10 +112,12 @@ def check_sample(key: str, s: dict, game_ids: dict) -> tuple[list[str], dict]:
 
 
 # ============================================================================ drawing
-def draw_overlay(frame: np.ndarray, a: np.ndarray, scale: int = 2) -> np.ndarray:
+def draw_overlay(frame: np.ndarray, a: np.ndarray, scale: int = 2, boxes=None) -> np.ndarray:
     import cv2
     img = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST).copy()
     H, W = img.shape[:2]
+    for x, y, w, h in boxes or []:  # loss-masked (inpainted) regions, dashed-looking red outline
+        cv2.rectangle(img, (x * scale, y * scale), ((x + w) * scale - 1, (y + h) * scale - 1), (255, 0, 0), 1)
     r = int(22 * scale / 2)
     for k, cx in enumerate((r + 6, W - r - 6)):  # left stick bottom-left, right stick bottom-right
         cy = H - r - 6
@@ -128,7 +142,7 @@ def make_grid(items: list[dict], n_cols: int, path: Path) -> None:
         idx = np.linspace(0, T - 1, n_cols).astype(int)
         tiles = []
         for i in idx:
-            t = draw_overlay(it["frames"][i], it["acts"][i])
+            t = draw_overlay(it["frames"][i], it["acts"][i], boxes=it["meta"].get("inpaint_boxes"))
             cv2.putText(t, f"t={i}", (4, t.shape[0] - 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
             tiles.append(t)
         row = np.concatenate(tiles, 1)
@@ -139,6 +153,8 @@ def make_grid(items: list[dict], n_cols: int, path: Path) -> None:
         cap = textwrap.shorten(it["caption"], width=int(row.shape[1] / 6.2))
         cv2.putText(bar, cap, (4, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         rows.append(np.concatenate([bar, row], 0))
+    wmax = max(r.shape[1] for r in rows)  # buckets have different widths: right-pad rows
+    rows = [np.pad(r, ((0, 0), (0, wmax - r.shape[1]), (0, 0))) for r in rows]
     grid = np.concatenate(rows, 0)
     cv2.imwrite(str(path), cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
 
@@ -148,10 +164,11 @@ def make_debug_video(it: dict, path: Path) -> None:
     fps = float(it["meta"].get("fps", 30))
     with av.open(str(path), "w") as c:
         st = c.add_stream("libx264", rate=round(fps))
-        f0 = draw_overlay(it["frames"][0], it["acts"][0])
+        boxes = it["meta"].get("inpaint_boxes")
+        f0 = draw_overlay(it["frames"][0], it["acts"][0], boxes=boxes)
         st.width, st.height, st.pix_fmt = f0.shape[1], f0.shape[0], "yuv420p"
         for fr, a in zip(it["frames"], it["acts"]):
-            for pkt in st.encode(av.VideoFrame.from_ndarray(draw_overlay(fr, a), format="rgb24")):
+            for pkt in st.encode(av.VideoFrame.from_ndarray(draw_overlay(fr, a, boxes=boxes), format="rgb24")):
                 c.mux(pkt)
         for pkt in st.encode():
             c.mux(pkt)
@@ -178,13 +195,15 @@ def main():
     game_ids = json.loads(gid_path.read_text()) if gid_path.exists() else {}
     total_fail, games_by_split = 0, {}
     for split in args.splits:
-        shards = sorted((root / split).glob("*.tar"))
+        shards = sorted((root / split).rglob("*.tar"))
         if not shards:
             print(f"[{split}] no shards found")
             continue
         idx = json.loads((root / split / "index.json").read_text()) if (root / split / "index.json").exists() else {}
         print(f"\n[{split}] {len(shards)} shards, index: samples={idx.get('samples')} hours={idx.get('hours')} "
               f"drops={idx.get('drops')}")
+        for b, st in sorted((idx.get("buckets") or {}).items(), key=lambda kv: -kv[1]["hours"]):
+            print(f"    bucket {b:>6} {st['width']}x{st['height']}: {st['samples']:,} samples, {st['hours']} h")
         picked = rng.sample(shards, min(args.num_shards, len(shards)))
         checked, failed, grid_items = 0, 0, []
         games = set()

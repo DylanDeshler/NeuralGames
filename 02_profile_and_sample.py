@@ -39,7 +39,7 @@ import pyarrow.dataset as ds
 from scipy.optimize import brentq
 from tqdm import tqdm
 
-from ng_common import DATA_ROOT, ACTION_DIM, STICK_THRESHOLDS, atomic_write_parquet, norm_title, setup_logging
+from ng_common import DATA_ROOT, ACTION_DIM, STICK_THRESHOLDS, atomic_write_parquet, setup_logging
 from ng_labels import GameLabeler, YouTubeMeta
 
 LIGHT_COLS = ["uuid", "shard", "video_id", "chunk_id", "game", "duration", "n_frames", "fps",
@@ -183,6 +183,46 @@ def activity_sensitivity(d2: pd.DataFrame, move: pd.Series, out_csv: Path) -> No
     print(piv.round(0).to_string())
 
 
+ASPECTS = [("21:9", 2.37), ("16:9", 16 / 9), ("16:10", 1.6), ("3:2", 1.5), ("4:3", 4 / 3), ("8:7", 8 / 7),
+           ("1:1", 1.0), ("3:4", 0.75), ("9:16", 9 / 16)]
+
+
+def aspect_report(d2: pd.DataFrame, meta_dir: Path, reports: Path) -> None:
+    """Content aspect ratio of the 2D pool by hours, from res + bbox_game_area (metadata only).
+
+    Hidden pillarboxing (a 4:3 game inside a 16:9 video without bbox_game_area) can't be seen here;
+    stage 03 detects it from pixels, so the real non-16:9 share is >= what this shows.
+    """
+    parts = []
+    for shard, sdf in d2.groupby("shard"):
+        t = ds.dataset(meta_dir / "index" / f"SHARD_{int(shard):04d}.parquet").to_table(
+            columns=["uuid", "bbox_game_area"], filter=pc.field("uuid").isin(sdf["uuid"].tolist()))
+        parts.append(t.to_pandas())
+    ga = pd.concat(parts).drop_duplicates("uuid").set_index("uuid")["bbox_game_area"]
+    x = d2[["uuid", "res_w", "res_h", "duration"]].copy()
+    g = x["uuid"].map(ga).map(lambda v: json.loads(v) if isinstance(v, str) else None)
+    fw = g.map(lambda d: (d["xbr"] - d["xtl"]) if isinstance(d, dict) else 1.0)
+    fh = g.map(lambda d: (d["ybr"] - d["ytl"]) if isinstance(d, dict) else 1.0)
+    x["aspect"] = (x["res_w"] * fw) / (x["res_h"] * fh).replace(0, np.nan)
+    x["has_game_area"] = g.map(lambda d: isinstance(d, dict))
+
+    def name(a):
+        if not np.isfinite(a):
+            return "unknown"
+        n, r = min(ASPECTS, key=lambda t: abs(np.log(a / t[1])))
+        return n if abs(a / r - 1) < 0.04 else f"other({a:.2f})"
+    x["aspect_name"] = x["aspect"].map(name)
+    t = x.groupby("aspect_name").agg(hours=("duration", "sum"), chunks=("uuid", "size"),
+                                     with_game_area=("has_game_area", "mean"))
+    t["hours"] /= 3600
+    t["share"] = t["hours"] / t["hours"].sum()
+    t = t.sort_values("hours", ascending=False)
+    t.to_csv(reports / "aspect_distribution.csv")
+    print("\n Content aspect ratio of the 2D pool (metadata; stage 03 also detects hidden pillarboxing):")
+    for k, r in t.iterrows():
+        print(f"   {k:<14} {r.hours:>9.1f} h  {r.share:>6.1%}   (bbox_game_area on {r.with_game_area:.0%})")
+
+
 def print_plan(d2: pd.DataFrame, targets: list[float], args, reports: Path, log) -> None:
     stats = d2.groupby("game_key").agg(game=("game_name", "first"), genre=("genre", "first"),
                                        videos=("video_id", "nunique"), n=("uuid", "size"), mh=("duration", "mean"))
@@ -267,17 +307,40 @@ def select_within_game(gdf: pd.DataFrame, quota: int, rng: np.random.Generator) 
     return gdf.index.to_numpy()[np.array(picked, int)]
 
 
-def recompute_activity(df: pd.DataFrame, meta_dir: Path, thresh: float, log) -> pd.Series:
-    """Recompute frac(||j_left|| > thresh) from the stored actions for the given chunks."""
-    out = pd.Series(np.nan, index=df.index)
-    pos = pd.Series(df.index, index=df["uuid"].to_numpy())
-    for shard, sdf in tqdm(df.groupby("shard"), desc="recompute activity"):
-        t = ds.dataset(meta_dir / "actions" / f"SHARD_{int(shard):04d}.parquet").to_table(
-            columns=["uuid", "actions"], filter=pc.field("uuid").isin(sdf["uuid"].tolist()))
-        for u, b in zip(t.column("uuid").to_pylist(), t.column("actions").to_pylist()):
-            a = np.frombuffer(b, np.float32).reshape(-1, ACTION_DIM)
-            out[pos[u]] = float((np.linalg.norm(a[:, :2], axis=1) > thresh).mean())
-    return out
+def recompute_activity(df: pd.DataFrame, meta_dir: Path, thresh: float, include_dpad: bool, log,
+                       cache_path: Path | None = None) -> pd.Series:
+    """frac(||j_left|| > thresh [OR any d-pad]) per chunk, recomputed from the stored actions.
+
+    Cached per (uuid, thresh, include_dpad) so re-runs of stage 02 are instant.
+    """
+    tag = f"move_{thresh:.2f}_{'dpad' if include_dpad else 'stick'}"
+    cache = pd.Series(dtype=np.float32)
+    if cache_path is not None and cache_path.exists():
+        c = pd.read_parquet(cache_path)
+        if tag in c.columns:
+            cache = c.set_index("uuid")[tag].dropna()
+    need = df[~df["uuid"].isin(cache.index)]
+    vals: dict[str, float] = {}
+    if len(need):
+        log.info("Computing %s for %s chunks from stored actions (cached afterwards) ...", tag, f"{len(need):,}")
+        for shard, sdf in tqdm(need.groupby("shard"), desc=f"recompute {tag}"):
+            t = ds.dataset(meta_dir / "actions" / f"SHARD_{int(shard):04d}.parquet").to_table(
+                columns=["uuid", "actions"], filter=pc.field("uuid").isin(sdf["uuid"].tolist()))
+            for u, b in zip(t.column("uuid").to_pylist(), t.column("actions").to_pylist()):
+                a = np.frombuffer(b, np.float32).reshape(-1, ACTION_DIM)
+                m = np.linalg.norm(a[:, :2], axis=1) > thresh
+                if include_dpad:
+                    m |= a[:, 4:8].max(1) > 0
+                vals[u] = float(m.mean())
+        if cache_path is not None:
+            new = pd.Series(vals, dtype=np.float32)
+            allv = pd.concat([cache, new])
+            old = pd.read_parquet(cache_path).set_index("uuid") if cache_path.exists() else pd.DataFrame()
+            old = old.reindex(old.index.union(allv.index))
+            old[tag] = allv.reindex(old.index)
+            atomic_write_parquet(old.rename_axis("uuid").reset_index(), cache_path)
+        cache = pd.concat([cache, pd.Series(vals, dtype=np.float32)])
+    return df["uuid"].map(cache).astype(np.float32)
 
 
 # ============================================================================ main
@@ -312,6 +375,8 @@ def main():
     # activity filter
     ap.add_argument("--move-thresh", type=float, default=0.2)
     ap.add_argument("--min-move-frac", type=float, default=0.15)
+    ap.add_argument("--move-includes-dpad", action=argparse.BooleanOptionalAction, default=True,
+                    help="count d-pad presses as movement (many 2D players never touch the stick)")
     ap.add_argument("--min-btn-frac", type=float, default=0.08)
     ap.add_argument("--min-chunks-per-game", type=int, default=3)
     ap.add_argument("--fps", type=float, nargs="*", default=[30.0, 60.0],
@@ -356,8 +421,10 @@ def main():
     df["status"] = df["game"].map(lambda g: slug_lab[g][0])
     df["genre"] = df["game"].map(lambda g: slug_lab[g][1])
     df["label_source"] = df["game"].map(lambda g: slug_lab[g][2])
-    df["game_key"] = df["game"].map(norm_title)
-    df["game_name"] = df["game"]
+    ckey = {g: lab.canonical_key(g) for g in df["game"].unique()}
+    df["game_key"] = df["game"].map(ckey)
+    disp = {k: (lab.title_2d[k][0] if k in lab.title_2d else lab.title_3d.get(k)) for k in set(ckey.values())}
+    df["game_name"] = [disp.get(k) or g for g, k in zip(df["game"], df["game_key"])]
     log.info("Slug labels: %s", df.groupby("status")["duration"].sum().div(3600).round(1).to_dict())
 
     yt = None
@@ -478,12 +545,18 @@ def main():
         d2 = d2[~d2["video_id"].isin(bad)]
 
     # ---------------------------------------------------------------- activity filter
-    col = f"frac_lstick_{int(round(args.move_thresh * 10)):02d}"
+    col = f"frac_{'move' if args.move_includes_dpad else 'lstick'}_{int(round(args.move_thresh * 10)):02d}"
     if args.move_thresh in STICK_THRESHOLDS and col in d2.columns:
         move = d2[col]
     else:
-        log.info("--move-thresh %.2f not precomputed; recomputing from actions", args.move_thresh)
-        move = recompute_activity(d2, meta_dir, args.move_thresh, log)
+        move = recompute_activity(d2, meta_dir, args.move_thresh, args.move_includes_dpad, log,
+                                  cache_path=meta_dir / "activity_cache.parquet")
+    if args.move_includes_dpad and args.plan and "frac_lstick_02" in d2.columns:
+        stick_only = d2[f"frac_lstick_{int(round(args.move_thresh * 10)):02d}"] >= args.min_move_frac
+        with_dpad = move >= args.min_move_frac
+        log.info("Movement filter: stick-only keeps %.1f h, stick-or-d-pad keeps %.1f h (+%.1f h rescued)",
+                 d2.loc[stick_only, "duration"].sum() / 3600, d2.loc[with_dpad, "duration"].sum() / 3600,
+                 d2.loc[with_dpad & ~stick_only, "duration"].sum() / 3600)
     if args.plan:
         activity_sensitivity(d2, move, reports / "idle_filter_sensitivity.csv")
     keep = (move >= args.min_move_frac) & (d2["frac_btn_gameplay"] >= args.min_btn_frac)
@@ -501,6 +574,7 @@ def main():
 
     # ---------------------------------------------------------------- alpha sampling
     if args.plan:
+        aspect_report(d2, meta_dir, reports)
         print_plan(d2, args.plan_targets, args, reports, log)
         return
     stats = d2.groupby("game_key").agg(n=("uuid", "size"), mh=("duration", "mean"))

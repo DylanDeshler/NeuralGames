@@ -19,6 +19,16 @@ genres_2d:
 
 games_2d:
   Metroidvania:
+    - "Blasphemous II"
+    - "Mandragora: Whispers of the Witch Tree"
+    - 9 Years of Shadows
+    - Iconoclasts
+    - "Castlevania: Harmony of Dissonance"
+    - "Castlevania: Circle of the Moon"
+    - "Laika: Aged Through Blood"
+    - "The Mummy Demastered"
+    - Vampire Killer
+    - "Shinobi: Art of Vengeance"
     - Hollow Knight
     - "Hollow Knight: Silksong"
     - Ori and the Blind Forest
@@ -75,6 +85,20 @@ games_2d:
     - Metroid Zero Mission
     - Metroid Samus Returns
   Platformer:
+    - "Super Mario World 2: Yoshi's Island"
+    - "Zelda II: The Adventure of Link"
+    - Wandersong
+    - Super Star Wars
+    - "Klonoa: Door to Phantomile"
+    - 20XX
+    - "E.V.O.: Search for Eden"
+    - ActRaiser 2
+    - Demon's Crest
+    - Pogostuck
+    - "The Jetsons: Invasion of the Planet Pirates"
+    - "Kirby's Adventure"
+    - "Donkey Kong Country Returns HD"
+    - "The Binding of Isaac: Repentance"
     - Celeste
     - Cuphead
     - "Cuphead: The Delicious Last Course"
@@ -215,6 +239,23 @@ games_2d:
     - "Battletoads"
     - "Ninja Saviors: Return of the Warriors"
   Arcade:
+    - Touhou
+    - "Embodiment of Scarlet Devil"
+    - "Perfect Cherry Blossom"
+    - "Imperishable Night"
+    - "Mountain of Faith"
+    - "Subterranean Animism"
+    - "Undefined Fantastic Object"
+    - "Ten Desires"
+    - "Double Dealing Character"
+    - "Legacy of Lunatic Kingdom"
+    - "Hidden Star in Four Seasons"
+    - "Wily Beast and Weakest Creature"
+    - "Unconnected Marketeers"
+    - "Fairy Wars"
+    - "Shoot the Bullet"
+    - "Violet Detector"
+    - "Phantasmagoria of Flower View"
     - Galaga
     - Pac-Man
     - Pac-Man Championship Edition 2
@@ -239,6 +280,13 @@ games_2d:
     - Galaxian
     - Bubble Bobble
   2D Action:
+    - "The Legend of Zelda: A Link to the Past"
+    - "The Legend of Zelda: Minish Cap"
+    - "The Legend of Zelda: Link's Awakening DX"
+    - Eldest Souls
+    - Unsighted
+    - Secret of Mana
+    - "Hotline Miami 2: Wrong Number"
     - Hyper Light Drifter   # top-down
     - Children of Morta     # top-down
     - Moonlighter           # top-down
@@ -279,6 +327,66 @@ games_2d:
 
 # Titles that must never be included, even if YouTube tags look 2D (3D or 2.5D-camera games).
 exclude_3d:
+  - Kingdom Hearts
+  - "Kingdom Hearts HD 1.5 + 2.5 ReMIX"
+  - "Dark Souls: Remastered"
+  - "Dark Souls II: Scholar of the First Sin"
+  - "The First Berserker: Khazan"
+  - Halo Infinite
+  - Halo
+  - Armored Core
+  - "Armored Core VI: Fires of Rubicon"
+  - Demon's Souls
+  - Another Crab's Treasure
+  - Super Mario 64
+  - MX Simulator
+  - "Clair Obscur: Expedition 33"
+  - Sea of Thieves
+  - SSX 3
+  - Persona 5 Royal
+  - Persona 3 Reload
+  - Persona 4 Golden
+  - Final Fantasy XIII
+  - Final Fantasy XVI
+  - Final Fantasy VII Remake
+  - Final Fantasy VII Rebirth
+  - "The Witcher 3: Wild Hunt"
+  - Marvel Rivals
+  - "Wuchang: Fallen Feathers"
+  - Outer Wilds
+  - Oblivion
+  - Skyrim
+  - Skater XL
+  - Riders Republic
+  - Lords of the Fallen
+  - "Ys VIII: Lacrimosa of Dana"
+  - "Granblue Fantasy: Relink"
+  - Code Vein
+  - Trackmania
+  - Starfield
+  - AI Limit
+  - Nioh
+  - Nioh 2
+  - Resident Evil
+  - Resident Evil 2
+  - Resident Evil 4
+  - Wreckfest
+  - Tunic
+  - Death Stranding
+  - Neon White
+  - Super Mario Galaxy
+  - A Hat in Time
+  - Donkey Kong 64
+  - Star Fox 64
+  - "The Legend of Zelda: Ocarina of Time"
+  - Shadow of the Colossus
+  - Mortal Shell
+  - Silent Hill 2
+  - Pikmin 2
+  - Transistor
+  - Pseudoregalia
+  - "Sackboy: A Big Adventure"
+  - Split Fiction
   - Risk of Rain 2
   - Risk of Rain Returns  # remove this line if you want RoR Returns (2D remake)
   - Returnal
@@ -363,6 +471,11 @@ keywords_3d:
 # Abbreviations / alternate names seen in YouTube titles -> canonical title (must exist in games_2d
 # or exclude_3d). Aliases are matched as whole words, even when short.
 aliases:
+  Dark Souls III: [profaned capital, firelink shrine, lothric castle, anor londo, untended graves,
+                   consumed king's garden, irithyll of the boreal valley, archdragon peak, road of sacrifices,
+                   grand archives, lord of cinder fallen, cathedral of the deep, high wall of lothric]
+  Touhou: [touhou, th06, th07, th08, th10, th11, th12, th13, th14, th15, th16, th17, th18]
+  "The Binding of Isaac": [isaac repentance starts, start of isaac]
   Castlevania Symphony of the Night: [sotn, symphony of the night]
   The Binding of Isaac: [isaac repentance, binding of isaac, tboi, isaac rebirth, isaac afterbirth]
   Celeste: [strawberry jam collab]
@@ -377,3 +490,15 @@ aliases:
 # Titles that are ordinary English words: only accepted when the YouTube title STARTS with them.
 ambiguous_titles: [Inside, Limbo, Braid, Grime, Gris, Islets, Unravel, Afterimage, Indivisible,
                    Sundered, Kunai, Constance, Mandragora, Contra, Jamestown, Biomorph, Noita]
+
+# Titles that count as ONE game for grouping and the unseen-game holdout (editions, DLC, series
+# with near-identical mechanics). Keys/values are titles; matching is normalized.
+game_groups:
+  "The Binding of Isaac": ["The Binding of Isaac: Rebirth", "The Binding of Isaac: Repentance"]
+  Touhou: ["Embodiment of Scarlet Devil", "Perfect Cherry Blossom", "Imperishable Night", "Mountain of Faith",
+           "Subterranean Animism", "Undefined Fantastic Object", "Ten Desires", "Double Dealing Character",
+           "Legacy of Lunatic Kingdom", "Hidden Star in Four Seasons", "Wily Beast and Weakest Creature",
+           "Unconnected Marketeers", "Fairy Wars", "Shoot the Bullet", "Violet Detector", "Phantasmagoria of Flower View"]
+  "Hotline Miami": ["Hotline Miami 2", "Hotline Miami 2: Wrong Number"]
+  "Ori and the Blind Forest": []
+  "Blasphemous": []

@@ -136,13 +136,16 @@ def activity_stats(a: np.ndarray) -> dict[str, float]:
     """Per-chunk activity statistics used by the idle filter in stage 02."""
     if len(a) == 0:
         return {f"frac_lstick_{int(t * 10):02d}": 0.0 for t in STICK_THRESHOLDS} | {
+            f"frac_move_{int(t * 10):02d}": 0.0 for t in STICK_THRESHOLDS} | {
             "frac_rstick_02": 0.0, "frac_btn_gameplay": 0.0, "frac_btn_any": 0.0,
             "mean_btn_per_frame": 0.0, "frac_any_input": 0.0}
     ln = np.linalg.norm(a[:, 0:2], axis=1)
     rn = np.linalg.norm(a[:, 2:4], axis=1)
     btn = a[:, 4:]
     gp = a[:, GAMEPLAY_BUTTON_IDX].max(1) > 0
+    dpad = a[:, 4:8].max(1) > 0  # many 2D players move with the d-pad, not the stick
     stats = {f"frac_lstick_{int(round(t * 10)):02d}": float((ln > t).mean()) for t in STICK_THRESHOLDS}
+    stats.update({f"frac_move_{int(round(t * 10)):02d}": float(((ln > t) | dpad).mean()) for t in STICK_THRESHOLDS})
     stats.update(
         frac_rstick_02=float((rn > 0.2).mean()),
         frac_btn_gameplay=float(gp.mean()),
@@ -154,9 +157,24 @@ def activity_stats(a: np.ndarray) -> dict[str, float]:
 
 
 # ----------------------------------------------------------------------------- misc
+_ROMAN = {"ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7", "viii": "8", "ix": "9"}
+
+
+def norm_words(s: str) -> list[str]:
+    """Lowercase words with roman numerals II-IX as digits ('I' and 'X' are left alone: Mega Man X != 10)."""
+    words = re.sub(r"[^a-z0-9]+", " ", (s or "").lower().replace("&", "and")).split()
+    single = [len(w) == 1 for w in words]
+    out = []
+    for i, w in enumerate(words):
+        # don't convert inside letter runs like "E.V.O." -> e v o
+        near_letters = (i > 0 and single[i - 1]) or (i + 1 < len(words) and single[i + 1])
+        out.append(w if near_letters else _ROMAN.get(w, w))
+    return out
+
+
 def norm_title(s: str) -> str:
-    """'Hollow Knight: Silksong' / 'hollow_knight__silksong' -> 'hollowknightsilksong'."""
-    return re.sub(r"[^a-z0-9]+", "", (s or "").lower().replace("&", "and"))
+    """'Hollow Knight: Silksong' / 'hollow_knight__silksong' -> 'hollowknightsilksong'; 'Blasphemous II' -> 'blasphemous2'."""
+    return "".join(norm_words(s))
 
 
 def parse_shard_spec(spec: str, n_total: int = 100) -> list[int]:

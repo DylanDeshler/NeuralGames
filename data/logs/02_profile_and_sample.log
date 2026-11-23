@@ -13,3 +13,24 @@
 2026-11-22 21:25:34 | INFO    | 02_profile_and_sample | Using --alpha 0.8000 -> 3.6 h
 2026-11-22 21:25:34 | INFO    | 02_profile_and_sample | split train             games=   5 videos=   15 chunks=    641 hours=    3.6
 2026-11-22 21:25:34 | INFO    | 02_profile_and_sample | Wrote /tmp/ng_test/m_alpha.parquet (641 chunks, 3.6 h). Reports in /tmp/ng_test/r_alpha
+2026-11-22 22:02:09 | INFO    | 02_profile_and_sample | Loading index (18 columns) ...
+2026-11-22 22:02:09 | INFO    | 02_profile_and_sample | Loaded 3,861 chunks from 16 videos
+2026-11-22 22:02:09 | INFO    | 02_profile_and_sample | fps filter [30.0, 60.0] -> 3,861 chunks
+2026-11-22 22:02:09 | INFO    | 02_profile_and_sample | Slug labels: {'2d': 20.899999618530273, '3d': 0.6000000238418579}
+2026-11-22 22:02:09 | INFO    | 02_profile_and_sample | 2D pool before activity filter: 3,755 chunks, 20.9 h
+2026-11-22 22:02:09 | INFO    | 02_profile_and_sample | Activity filter (move>0.20 in >=15% frames AND buttons in >=8% frames): kept 72.5% (3,755 -> 2,721 chunks)
+2026-11-23 00:55:46 | INFO    | 02_profile_and_sample | Loading index (18 columns) ...
+2026-11-23 00:55:46 | INFO    | 02_profile_and_sample | Loaded 3,861 chunks from 16 videos
+2026-11-23 00:55:46 | INFO    | 02_profile_and_sample | fps filter [30.0, 60.0] -> 3,861 chunks
+2026-11-23 00:55:46 | INFO    | 02_profile_and_sample | Slug labels: {'2d': 20.899999618530273, '3d': 0.6000000238418579}
+2026-11-23 00:55:46 | INFO    | 02_profile_and_sample | 2D pool before activity filter: 3,755 chunks, 20.9 h
+2026-11-23 00:55:46 | INFO    | 02_profile_and_sample | Computing move_0.20_dpad for 3,755 chunks from stored actions (cached afterwards) ...
+2026-11-23 00:55:46 | INFO    | 02_profile_and_sample | Movement filter: stick-only keeps 18.3 h, stick-or-d-pad keeps 18.5 h (+0.2 h rescued)
+2026-11-23 00:55:46 | INFO    | 02_profile_and_sample | Activity filter (move>0.20 in >=15% frames AND buttons in >=8% frames): kept 73.4% (3,755 -> 2,757 chunks)
+2026-11-23 00:55:47 | INFO    | 02_profile_and_sample | Loading index (18 columns) ...
+2026-11-23 00:55:47 | INFO    | 02_profile_and_sample | Loaded 3,861 chunks from 16 videos
+2026-11-23 00:55:47 | INFO    | 02_profile_and_sample | fps filter [30.0, 60.0] -> 3,861 chunks
+2026-11-23 00:55:47 | INFO    | 02_profile_and_sample | Slug labels: {'2d': 20.899999618530273, '3d': 0.6000000238418579}
+2026-11-23 00:55:47 | INFO    | 02_profile_and_sample | 2D pool before activity filter: 3,755 chunks, 20.9 h
+2026-11-23 00:55:47 | INFO    | 02_profile_and_sample | Movement filter: stick-only keeps 18.3 h, stick-or-d-pad keeps 18.5 h (+0.2 h rescued)
+2026-11-23 00:55:47 | INFO    | 02_profile_and_sample | Activity filter (move>0.20 in >=15% frames AND buttons in >=8% frames): kept 73.4% (3,755 -> 2,757 chunks)

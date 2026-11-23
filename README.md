@@ -1,14 +1,14 @@
 # NitroGen → 2D action-conditioned world-model dataset
 
 A pipeline that turns the `nvidia/NitroGen` action annotations, plus the public YouTube videos they
-refer to, into WebDataset shards of `(256×256 video, (T,21) actions, caption, game_id)`. Every stage
+refer to, into WebDataset shards of `(video in an aspect-ratio bucket, (T,21) actions, caption, game_id)`. Every stage
 can be resumed: re-running a stage skips work that's already done.
 
 ```
 01_fetch_metadata.py      HF tarballs -> compact per-shard index + action parquet       (CPU, ~25-60 GB)
 02b_llm_label_games.py    (optional) LLM names the game per video from YouTube metadata    (GPU, ~minutes)
 02_profile_and_sample.py  2D filter, idle filter, alpha-sampling, game holdout -> manifest (CPU, minutes)
-03_download_and_process.py  20 s clip fetch, crop/letterbox 256, overlay inpaint, align   (network-bound)
+03_download_and_process.py  20 s clip fetch, aspect bucket (no letterbox), inpaint, align (network-bound)
 04_caption_frames.py      Qwen2.5-VL caption of frame 0 (vLLM / transformers / OpenAI API) (GPU)
 05_pack_webdataset.py     ~1 GB WebDataset shards: train/ and val_unseen_games/
 verify_dataset.py         alignment/range assertions + visual debug grid & overlay videos
@@ -151,8 +151,30 @@ python 03_download_and_process.py --status
 * `--method auto` (default): yt-dlp resolves the stream URL, then ffmpeg seeks with HTTP range
   requests and decodes only [start, end). If that fails, it falls back to
   `yt-dlp --download-sections "*start-end" --force-keyframes-at-cuts`.
-* `crop(bbox_game_area) → fps=annotation fps → area-downscale → letterbox pad to 256×256 (black) →
-  cv2.inpaint(TELEA)` over the controller overlay and `bbox_others`. Output has exactly `T` frames,
+* **Aspect-ratio buckets, no letterboxing** (built for pixel-space patch transformers like JiT):
+  `crop(bbox_game_area) → detect static black pillar/letterbox bars → pick the bucket with the closest
+  aspect → resize to cover it, centre-crop the excess (≤ --max-crop, typically 1–2 %) → cv2.inpaint(TELEA)`
+  over the controller overlay and `bbox_others`. There's no distortion, and every token is game content.
+  `--buckets auto` (default) uses the canonical buckets below plus filler buckets (24 in total,
+  216–272 tokens at `--patch 16`), so every aspect from 0.5 to 2.45 is within 5 % of a bucket and no
+  clip needs padding. Canonical buckets:
+
+  | bucket | px | aspect | typical source |
+  |---|---|---|---|
+  | 21x12 | 336×192 | 1.75 | 16:9 (most modern games, ~75 % of hours by metadata) |
+  | 19x14 | 304×224 | 1.36 | 4:3 (retro, often pillarboxed inside 16:9 videos) |
+  | 17x15 | 272×240 | 1.13 | 8:7 (SNES/NES) |
+  | 18x12 | 288×192 | 1.50 | 3:2 (GBA) |
+  | 19x12 | 304×192 | 1.58 | 16:10 |
+  | 16x16 | 256×256 | 1.00 | square |
+  | 24x10 | 384×160 | 2.40 | 21:9 |
+  | 14x19, 12x21 | 224×304, 192×336 | 0.74, 0.57 | vertical / TATE |
+
+  Pass an explicit list to restrict them (e.g. `--buckets 21x12,19x14,16x16`); with fewer buckets,
+  clips beyond `--max-crop` are fit and padded (`fit_mode`, `pad`, `content_wh` in the JSON, already
+  excluded by `ng_masks.pixel_valid_mask`). `--patch 32` doubles every side for 512-class models.
+  `02_profile_and_sample.py --plan` prints the pool's aspect-ratio split (metadata only; hidden
+  pillarboxing is detected later, from pixels, in stage 03). `--status` and the run summary report the bucket counts. Output has exactly `T` frames,
   where T is the length of the actions (tail deficits ≤6 frames are padded by repeating the last
   frame and recorded in `meta.json`).
 * Output: `data/processed/<video_id>/<uuid>/{frames.mp4, actions.npy, frame0.png, meta.json}`. The
@@ -189,10 +211,36 @@ the manifest columns `caption`, `vlm_perspective`, `vlm_is_2d` and `frame0_dark`
 python 05_pack_webdataset.py --drop-vlm-3d          # ~1 GB shards in data/webdataset/{train,val_unseen_games}
 python verify_dataset.py --num-shards 3 --debug-videos 2
 ```
-Each sample has `<uuid>.mp4`, `.actions.npy` (T,21 float32), `.txt`, `.cls` (game_id) and `.json`.
+Shards are written per bucket (`train/21x12/train-21x12-000000.tar`, ...), and `index.json` lists
+each bucket's resolution, samples and hours. To train, sample a bucket in proportion to its hours,
+then stream same-shape batches from its shards. Each sample has `<uuid>.mp4`, `.actions.npy`
+(T,21 float32), `.txt`, `.cls` (game_id) and `.json` (incl. `width`, `height`, `bucket`, `inpaint_boxes`).
 `verify_dataset.py` asserts `len(frames) == len(actions)`, checks value ranges, binary buttons, black
 letterbox bars and train/val game disjointness. It writes `data/debug/grid_<split>.png` and overlay
 videos. Watch the overlay videos to confirm that stick motion matches on-screen motion before training.
+
+## Overlay masking at training time
+Loss masking alone isn't enough. The overlay *is* the action label in pixel form, so if it's
+visible in the context frames, the model can read actions from pixels and ignore the action input.
+The pipeline therefore:
+1. **removes it from the input**: stage 03 inpaints `bbox_controller_overlay` and `bbox_others`
+   before anything is encoded;
+2. **records the regions**: each sample's JSON has `inpaint_boxes` ([x, y, w, h] in output-pixel
+   coordinates, already grown by `--mask-dilate`), plus `pad`/`content_wh` for the letterbox.
+
+On the training side, use `ng_masks.py`:
+```python
+from ng_masks import pixel_valid_mask, grid_valid_mask, augment_fake_boxes
+valid = pixel_valid_mask(info)                    # (H, W): 1 = supervise; 0 = inpainted overlay (or pad, fit-mode only)
+# pixel-space models (JiT, x-prediction): mask the per-pixel loss directly
+loss = (per_pixel_loss * valid[None, None]).sum() / (valid.sum() * C).clip(min=1)
+# per-token view if needed (e.g. drop fully masked tokens): grid_valid_mask(valid, stride=patch)
+# optional mask-channel conditioning: concat 1 - augment_fake_boxes(valid, rng) as a 4th input channel
+# to the patch embedding, blank the same pixels in context frames, and pass all-ones at inference
+```
+With a temporally compressing VAE, mask a latent if the region is masked in any frame it covers. The
+boxes are fixed per clip, so this is just broadcasting. Check controllability after training with an
+action-shuffle test (prediction error should rise noticeably with shuffled actions).
 
 ## Action vector (21-d, float32)
 `[j_left_x, j_left_y, j_right_x, j_right_y, dpad_down, dpad_left, dpad_right, dpad_up, left_shoulder,
