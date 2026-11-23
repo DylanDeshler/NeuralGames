@@ -35,6 +35,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pyarrow.dataset as ds
 from tqdm import tqdm
@@ -321,6 +322,20 @@ def main():
     print(" hours by perspective (game-level where confident): "
           + str(df.groupby("final_perspective")["hours"].sum().round(0).to_dict()))
     print(f" unparsable outputs: {(~df.llm_parse_ok).sum()}")
+    # trust check: LLM game-level 2D/3D call vs the curated lists, on games both cover (weighted by hours)
+    g = df[df.llm_game.notna()].groupby("llm_game_key").agg(game=("llm_game", "first"), hours=("hours", "sum"),
+                                                             persp=("final_perspective", lambda s: s.mode().iat[0]))
+    g["curated"] = g["game"].map(lambda n: lab.label_slug(n)[0])
+    g = g[g["curated"].isin(["2d", "3d"]) & ~g["persp"].isin(["unknown", "mixed"])]
+    if len(g):
+        g["llm"] = np.where(g["persp"].isin(["side-view-2d", "top-down-2d"]), "2d", "3d")
+        agree = (g["llm"] == g["curated"])
+        print(f" LLM vs curated list on {len(g)} overlapping games: {agree.mean():.1%} agree "
+              f"({(g.hours * agree).sum() / g.hours.sum():.1%} by hours)")
+        bad = g[~agree].sort_values("hours", ascending=False).head(12)
+        if len(bad):
+            print("   disagreements (curated wins in stage 02): " +
+                  ", ".join(f"{r.game} [llm {r.persp}, list {r.curated}]" for r in bad.itertuples()))
     top = (df[df.llm_game.notna()].groupby("llm_game_key")
            .agg(game=("llm_game", "first"), videos=("video_id", "size"), hours=("hours", "sum"),
                 persp=("final_perspective", lambda s: s.mode().iat[0]))
