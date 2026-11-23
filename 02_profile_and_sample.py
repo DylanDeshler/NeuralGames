@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import math
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -40,7 +41,7 @@ from scipy.optimize import brentq
 from tqdm import tqdm
 
 from ng_common import DATA_ROOT, ACTION_DIM, STICK_THRESHOLDS, atomic_write_parquet, setup_logging
-from ng_labels import GameLabeler, YouTubeMeta
+from ng_labels import BotBlockedError, GameLabeler, YouTubeMeta, video_urls
 
 LIGHT_COLS = ["uuid", "shard", "video_id", "chunk_id", "game", "duration", "n_frames", "fps",
               "res_h", "res_w", "action_source", "frac_lstick_01", "frac_lstick_02", "frac_lstick_03",
@@ -372,6 +373,11 @@ def main():
     ap.add_argument("--yt-max-videos", type=int, default=0, help="cap lookups (0 = no cap; for testing)")
     ap.add_argument("--cookies", default=None)
     ap.add_argument("--cookies-from-browser", default=None)
+    ap.add_argument("--yt-backend", choices=["auto", "api", "ytdlp"], default="auto",
+                    help="metadata source for YouTube videos: 'api' = YouTube Data API v3 (no bot checks; "
+                         "needs --yt-api-key or env YOUTUBE_API_KEY), 'ytdlp' = scraping, 'auto' = api if a key is set")
+    ap.add_argument("--yt-api-key", default=os.environ.get("YOUTUBE_API_KEY"))
+    ap.add_argument("--proxy", default=None, help="proxy for yt-dlp metadata requests, e.g. socks5://host:port")
     # activity filter
     ap.add_argument("--move-thresh", type=float, default=0.2)
     ap.add_argument("--min-move-frac", type=float, default=0.15)
@@ -429,14 +435,16 @@ def main():
 
     yt = None
     if args.enrich_youtube or args.check_availability:
+        backend = args.yt_backend if args.yt_backend != "auto" else ("api" if args.yt_api_key else "ytdlp")
         yt = YouTubeMeta(Path(args.yt_cache), args.yt_workers, args.yt_min_interval, args.cookies,
-                         args.cookies_from_browser, log)
+                         args.cookies_from_browser, log, backend=backend, api_key=args.yt_api_key, proxy=args.proxy)
+        urls = video_urls(Path(args.meta_dir))
     if args.enrich_youtube:
         unk_vids = df.loc[df["status"] == "unknown", "video_id"].unique().tolist()
         # biggest videos first so a capped run covers the most hours
         order = df[df["video_id"].isin(unk_vids)].groupby("video_id")["duration"].sum().sort_values(ascending=False)
         unk_vids = order.index.tolist()[: args.yt_max_videos or None]
-        meta = yt.get_many(unk_vids)
+        meta = yt.get_many(unk_vids, urls)
         vid_update, unk_slug_votes = {}, defaultdict(Counter)
         slug_of_vid = df.drop_duplicates("video_id").set_index("video_id")["game"].to_dict()
         for v in unk_vids:
@@ -536,7 +544,7 @@ def main():
 
     # ---------------------------------------------------------------- availability
     if args.check_availability:
-        meta = yt.get_many(d2["video_id"].unique().tolist())
+        meta = yt.get_many(d2["video_id"].unique().tolist(), urls)
         bad = {v for v, m in meta.items() if m.get("status") == "unavailable"}
         log.info("Availability: %d / %d 2D videos unavailable -> dropped", len(bad), d2.video_id.nunique())
         d2 = d2[~d2["video_id"].isin(bad)]
@@ -633,4 +641,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BotBlockedError as e:
+        raise SystemExit(f"\nSTOPPED: {e}")

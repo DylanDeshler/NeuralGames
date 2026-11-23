@@ -40,7 +40,7 @@ import pyarrow.dataset as ds
 from tqdm import tqdm
 
 from ng_common import DATA_ROOT, atomic_write_parquet, norm_title, setup_logging
-from ng_labels import GameLabeler, YouTubeMeta
+from ng_labels import BotBlockedError, GameLabeler, YouTubeMeta, video_urls
 
 PERSPECTIVES = ["side-view-2d", "top-down-2d", "isometric", "3d", "mixed", "unknown"]
 GENRES = ["Platformer", "Metroidvania", "Run and Gun", "Beat 'em up", "Arcade", "Shmup", "Fighting",
@@ -173,6 +173,11 @@ def main():
     ap.add_argument("--yt-min-interval", type=float, default=0.5)
     ap.add_argument("--cookies", default=None)
     ap.add_argument("--cookies-from-browser", default=None)
+    ap.add_argument("--yt-backend", choices=["auto", "api", "ytdlp"], default="auto",
+                    help="metadata source for YouTube videos: 'api' = YouTube Data API v3 (no bot checks; "
+                         "needs --yt-api-key or env YOUTUBE_API_KEY), 'ytdlp' = scraping, 'auto' = api if a key is set")
+    ap.add_argument("--yt-api-key", default=os.environ.get("YOUTUBE_API_KEY"))
+    ap.add_argument("--proxy", default=None, help="proxy for yt-dlp metadata requests, e.g. socks5://host:port")
     args = ap.parse_args()
 
     log = setup_logging("02b_llm_label_games")
@@ -205,9 +210,11 @@ def main():
 
     if len(todo):
         # ---- YouTube metadata (cached; private/removed videos are skipped)
+        backend = args.yt_backend if args.yt_backend != "auto" else ("api" if args.yt_api_key else "ytdlp")
         yt = YouTubeMeta(Path(args.yt_cache), args.yt_workers, args.yt_min_interval, args.cookies,
-                         args.cookies_from_browser, log)
-        meta = yt.get_many(todo.index.tolist())
+                         args.cookies_from_browser, log, backend=backend, api_key=args.yt_api_key, proxy=args.proxy)
+        urls = video_urls(Path(args.meta_dir))
+        meta = yt.get_many(todo.index.tolist(), urls)
         ok = [v for v in todo.index if meta.get(v, {}).get("status") == "ok"]
         log.info("YouTube metadata: %d ok, %d unavailable, %d errors (errors are retried next run)", len(ok),
                  sum(meta.get(v, {}).get("status") == "unavailable" for v in todo.index),
@@ -258,4 +265,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BotBlockedError as e:
+        raise SystemExit(f"\nSTOPPED: {e}")

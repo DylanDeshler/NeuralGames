@@ -97,6 +97,7 @@ class StreamResolver:
         self.locks: dict[str, threading.Lock] = {}
         self.glock = threading.Lock()
         self.dead: dict[str, str] = {}
+        self.bot_streak = 0  # consecutive bot-check / 429 failures across all workers
 
     def ydl_opts(self, fmt: str) -> dict:
         o = {"quiet": True, "no_warnings": True, "noplaylist": True, "format": fmt, "socket_timeout": 30}
@@ -104,6 +105,8 @@ class StreamResolver:
             o["cookiefile"] = self.args.cookies
         if self.args.cookies_from_browser:
             o["cookiesfrombrowser"] = (self.args.cookies_from_browser,)
+        if self.args.proxy:
+            o["proxy"] = self.args.proxy
         return o
 
     def resolve(self, video_id: str, url: str, fmt: str, cap: int, limiter: RateLimiter) -> dict:
@@ -442,6 +445,8 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
                     hdr = "".join(f"{k}: {v}\r\n" for k, v in (info.get("headers") or {}).items())
                     inp = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                            "-rw_timeout", "30000000", *(["-headers", hdr] if hdr else []),
+                           # googlevideo URLs are bound to the resolving IP: fetch through the same proxy
+                           *(["-http_proxy", args.proxy] if args.proxy and args.proxy.startswith("http") else []),
                            "-ss", f"{start:.3f}", "-t", f"{dur + 1.0:.3f}", "-i", info["url"]]
                 else:
                     if row.video_id in resolver.dead:
@@ -464,6 +469,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
                     resolver.invalidate(row.video_id)
                 if RATE_ERR.search(str(e)):
                     limiter.penalize(args.rate_penalty)
+                    resolver.bot_streak += 1
                 log.debug("%s via %s failed: %s", row.uuid, method, e)
         if method_used is None:
             raise last_err or RuntimeError("no method succeeded")
@@ -494,6 +500,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
             os.replace(work / name, out_dir / name)
         os.replace(work / "meta.json", out_dir / "meta.json")
         src_actions.unlink(missing_ok=True)
+        resolver.bot_streak = 0
         return {"status": "ok", "method": method_used, "padded": n_out - decoded, "bucket": geo["bucket"]}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -507,6 +514,8 @@ def download_section(url: str, fmt: str, t0: float, t1: float, tmp: Path, args) 
         cmd[1:1] = ["--cookies", args.cookies]
     if args.cookies_from_browser:
         cmd[1:1] = ["--cookies-from-browser", args.cookies_from_browser]
+    if args.proxy:
+        cmd[1:1] = ["--proxy", args.proxy]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=args.download_timeout)
     if p.returncode != 0:
         msg = (p.stderr or p.stdout)[-600:]
@@ -609,6 +618,11 @@ def main():
     ap.add_argument("--min-free-gb", type=float, default=50.0)
     ap.add_argument("--cookies", default=None)
     ap.add_argument("--cookies-from-browser", default=None)
+    ap.add_argument("--proxy", default=None,
+                    help="proxy for yt-dlp AND the ffmpeg fetch (googlevideo URLs are IP-bound), e.g. "
+                         "http://user:pass@host:port (ffmpeg needs http; socks works only with --method sections)")
+    ap.add_argument("--max-bot-streak", type=int, default=30,
+                    help="stop submitting after this many consecutive bot-check/429 failures (IP is blocked)")
     ap.add_argument("--status", action="store_true", help="print progress and exit")
     args = ap.parse_args()
 
@@ -686,6 +700,11 @@ def main():
         pending, it = set(), iter(rows)
         stop = False
         while True:
+            if not stop and resolver.bot_streak >= args.max_bot_streak:
+                log.error("YouTube is bot-blocking this IP (%d consecutive bot-check/429 failures). Stopping; progress "
+                          "is saved. Use --cookies (logged-in, ideally with a PO-token provider plugin) or --proxy, "
+                          "or run stage 03 from another network.", resolver.bot_streak)
+                stop = True
             while not stop and len(pending) < args.workers * 2:
                 if free_gb(args.processed_dir) < args.min_free_gb:
                     log.error("Free disk < %.0f GB — stopping submission (re-run to resume).", args.min_free_gb)

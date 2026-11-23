@@ -66,6 +66,22 @@ $NG_DATA_ROOT/
 ```
 Every path can still be overridden per script (`--meta-dir`, `--processed-dir`, `--out`, ...).
 
+## YouTube access from cloud machines
+YouTube often answers datacenter IPs with "Sign in to confirm you're not a bot".
+* **Metadata (stages 02/02b): use the YouTube Data API v3.** No bot checks, 50 videos per request,
+  and ~300 quota units for 15k videos (10k/day free). Create a key at console.cloud.google.com →
+  APIs & Services → enable "YouTube Data API v3" → Credentials → API key. Then
+  `export YOUTUBE_API_KEY=...` (`--yt-backend auto` picks it up). Non-YouTube sources in the index
+  (e.g. Twitch VODs, ids like `v2170866956`) are fetched from their own URL with yt-dlp, and expired
+  VODs are marked unavailable.
+* **Video downloads (stage 03) can't use the API.** Options, best first: run stage 03 from a residential
+  network; `--cookies cookies.txt` from a logged-in (throwaway) account plus the
+  `bgutil-ytdlp-pot-provider` PO-token plugin for yt-dlp; or `--proxy http://user:pass@host:port`
+  (applied to both yt-dlp and the ffmpeg fetch, since the stream URLs are tied to the IP that
+  resolved them).
+* Both stages stop early with a clear message after repeated bot checks (`--max-bot-streak`) instead
+  of grinding. Progress is cached, so just re-run once access is fixed.
+
 ## Step by step
 
 ### 1. Metadata sync
