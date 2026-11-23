@@ -141,6 +141,8 @@ def main():
                  "non_gameplay": 0, "qc_unparsed": 0, "frame0_not_gameplay": 0, "val_leak": 0, "bad_shape": 0}
         stats: dict[str, dict] = {}   # bucket -> {samples, frames, hours, width, height}
         newly_packed: list[str] = []
+        state_path = sdir / "_next_shard.json"
+        next_shard: dict[str, int] = json.loads(state_path.read_text()) if (args.append and state_path.exists()) else {}
         writers: dict[str, "wds.ShardWriter"] = {}
         pending_del: dict[str, list[Path]] = {}  # bucket -> clip dirs whose shard is still open
         n_deleted = 0
@@ -200,7 +202,8 @@ def main():
                 bucket = meta.get("bucket", f"{meta['width']}x{meta['height']}px")
                 if bucket not in writers:  # one shard series per aspect bucket -> same-shape batches
                     (sdir / bucket).mkdir(parents=True, exist_ok=True)
-                    start = len(list((sdir / bucket).glob("*.tar")))  # append: continue numbering
+                    # continue numbering from persistent state (local shards may have been uploaded and deleted)
+                    start = max(next_shard.get(bucket, 0), len(list((sdir / bucket).glob("*.tar"))))
                     writers[bucket] = wds.ShardWriter(str(sdir / bucket / f"{split}-{bucket}-%06d.tar"),
                                                       maxsize=int(args.shard_size_gb * 1e9),
                                                       maxcount=args.max_samples_per_shard, verbose=0,
@@ -247,8 +250,10 @@ def main():
                 st["frames"] += int(meta["n_frames"])
                 st["hours"] += meta["n_frames"] / meta["fps"] / 3600
         finally:
-            for w in writers.values():
+            for b, w in writers.items():  # read the counter BEFORE close(): ShardWriter.close() deletes .shard
+                next_shard[b] = max(next_shard.get(b, 0), int(getattr(w, "shard", 0)))
                 w.close()
+            atomic_write_json(state_path, next_shard)
         if args.delete_processed:  # all shards closed successfully
             for dirs in pending_del.values():
                 flush_deletes(dirs)
@@ -265,7 +270,8 @@ def main():
             for k, v in (prev_index.get("drops") or {}).items():
                 drops[k] = drops.get(k, 0) + (v if k != "not_processed" else 0)
         for b, st in stats.items():
-            st["shards"] = sorted(f"{b}/{p.name}" for p in (sdir / b).glob("*.tar"))
+            old_shards = set(((prev_index or {}).get("buckets") or {}).get(b, {}).get("shards", [])) if args.append else set()
+            st["shards"] = sorted(old_shards | {f"{b}/{p.name}" for p in (sdir / b).glob("*.tar")})
             st["hours"] = round(st["hours"], 2)
         n = sum(st["samples"] for st in stats.values())
         hours = sum(st["hours"] for st in stats.values())

@@ -96,6 +96,13 @@ python run_pipeline.py bulk  --proxy http://127.0.0.1:8899 --workers 8 --min-fre
   → `04` → `05 --append --delete-processed` until the manifest is done, the disk floor is reached, or
   downloads stop. Stop it any time (Ctrl-C) and re-run the same command to resume.
 * `--resample` re-runs stage 02 first, `--skip-layout` skips 02c, and `--dry-run` prints the commands.
+* **`--push-to-hub <user>/<repo>`** (bulk): after each cycle, verify the new shards, upload them in one commit
+  to a **private** Hugging Face dataset repo (`06_push_to_hub.py`), check the uploaded sizes, then delete the
+  local copies. The disk then only holds one cycle (~20k clips), so the whole 2D pool fits regardless of local
+  disk size. Shard numbering continues across cycles from `_next_shard.json`, so nothing on the Hub is
+  overwritten, and `index.json` keeps listing uploaded shards. Training streams the shards from the Hub (see
+  the docstring of `06_push_to_hub.py`). Repos are created private; `--public` is refused unless passed to 06
+  explicitly. The videos aren't yours to redistribute, and NitroGen's labels are CC BY-NC.
 
 ## Step by step
 

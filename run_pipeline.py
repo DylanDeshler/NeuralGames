@@ -116,10 +116,12 @@ def smoke(a, log):
     if a.resample:
         resample(a, log)
     if not a.dry_run:
-        for p in (processed, wds, debug, tmp):
+        wipe = (wds, debug, tmp) if (a.resume and man.exists()) else (processed, wds, debug, tmp)
+        for p in wipe:  # --resume keeps already-downloaded smoke clips (03 skips them; 04/05 redo the rest)
             shutil.rmtree(p, ignore_errors=True)
         root.mkdir(parents=True, exist_ok=True)
-        shutil.copy(man_main, man)  # isolated copy: 04/05 write into it, the real manifest stays untouched
+        if not (a.resume and man.exists()):
+            shutil.copy(man_main, man)  # isolated copy: 04/05 write into it, the real manifest stays untouched
         debug.mkdir(parents=True, exist_ok=True)
     failed = None
     try:
@@ -206,6 +208,10 @@ def bulk(a, log):
         if count_clips(processed) or a.dry_run:
             run([PY, "04_caption_frames.py"], log, a.dry_run)
             run([PY, "05_pack_webdataset.py", "--append", "--delete-processed"], log, a.dry_run)
+            if a.push_to_hub:  # check this cycle's shards before they leave the machine, then upload + free disk
+                run([PY, "verify_dataset.py", "--num-shards", "5", "--debug-videos", "0",
+                     "--out-dir", str(DATA_ROOT / "debug" / f"cycle_{cycle:03d}")], log, a.dry_run)
+                run([PY, "06_push_to_hub.py", "--repo-id", a.push_to_hub, "--delete-local"], log, a.dry_run)
         run([PY, "03_download_and_process.py", "--status"], log, a.dry_run)
         if a.dry_run or (a.max_cycles and cycle >= a.max_cycles):
             break
@@ -213,7 +219,8 @@ def bulk(a, log):
             log.info("No new clips this cycle: either everything is done, the disk floor (--min-free-gb %s) is "
                      "reached even after packing, or downloads are blocked (see 03's log). Stopping.", a.min_free_gb)
             break
-    run([PY, "verify_dataset.py", "--debug-videos", "2"], log, a.dry_run)
+    if not a.push_to_hub:  # with --push-to-hub every cycle was verified before upload
+        run([PY, "verify_dataset.py", "--debug-videos", "2"], log, a.dry_run)
 
 
 def main():
@@ -231,7 +238,11 @@ def main():
     ap.add_argument("--layout-model", default=None,
                     help="VLM for 02c, e.g. Qwen/Qwen2.5-VL-32B-Instruct-AWQ (better layouts than the 7B default)")
     ap.add_argument("--resample", action="store_true", help="re-run stage 02 first")
+    ap.add_argument("--resume", action="store_true", help="smoke: keep already-processed smoke clips instead of starting over")
     ap.add_argument("--dry-run", action="store_true", help="print the commands without running them")
+    ap.add_argument("--push-to-hub", default=None, metavar="REPO_ID",
+                    help="bulk: after each cycle verify + upload new shards to this PRIVATE HF dataset repo and delete "
+                         "them locally (disk then only holds one cycle)")
     a = ap.parse_args()
     log = setup_logging("run_pipeline")
     log.info("NG_DATA_ROOT=%s mode=%s", DATA_ROOT, a.mode)

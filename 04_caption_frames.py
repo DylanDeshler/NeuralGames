@@ -246,8 +246,9 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=220)
     ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
-    ap.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=False,
-                    help="skip torch.compile + CUDA graphs (use if vLLM engine startup fails)")
+    ap.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True,
+                    help="skip torch.compile + CUDA graphs (robust startup; same default as 02b/02c). "
+                         "--no-enforce-eager is faster once `build-essential` is installed and compile works")
     ap.add_argument("--gpu-mem", type=float, default=0.90)
     ap.add_argument("--api-base", default="http://localhost:8000/v1")
     ap.add_argument("--api-key", default=None)
