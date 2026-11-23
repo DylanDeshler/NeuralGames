@@ -84,6 +84,8 @@ def main():
     ap.add_argument("--min-gameplay-frac", type=float, default=0.75,
                     help="drop clips where stage 04's VLM saw gameplay in fewer than this fraction of sampled frames "
                          "(menus, title/option screens, loading, emulator UIs). 0 disables")
+    ap.add_argument("--require-frame0-gameplay", action=argparse.BooleanOptionalAction, default=True,
+                    help="drop clips whose first frame (the caption / text-to-world conditioning frame) isn't gameplay")
     ap.add_argument("--val-leak-check", action=argparse.BooleanOptionalAction, default=True,
                     help="drop val_unseen_games videos whose frames the VLM recognizes as a different game that is in train")
     ap.add_argument("--genres", default="./config/genres_2d.yaml")
@@ -124,7 +126,7 @@ def main():
         # shuffle so each shard mixes games (important for streaming training)
         sm = sm.sample(frac=1.0, random_state=args.seed)
         drops = {"not_processed": 0, "no_caption": 0, "vlm_3d": 0, "dark": 0, "black_frames": 0,
-                 "non_gameplay": 0, "val_leak": 0, "bad_shape": 0}
+                 "non_gameplay": 0, "qc_unparsed": 0, "frame0_not_gameplay": 0, "val_leak": 0, "bad_shape": 0}
         stats: dict[str, dict] = {}   # bucket -> {samples, frames, hours, width, height}
         writers: dict[str, "wds.ShardWriter"] = {}
         pending_del: dict[str, list[Path]] = {}  # bucket -> clip dirs whose shard is still open
@@ -154,9 +156,15 @@ def main():
                 if args.drop_dark_frame0 and meta.get("frame0_dark"):
                     drops["dark"] += 1
                     continue
-                fg = meta.get("vlm_frac_gameplay")
+                fg, scr = meta.get("vlm_frac_gameplay"), meta.get("vlm_screens") or []
+                if args.min_gameplay_frac > 0 and "caption" in meta and fg is None and not args.allow_missing_caption:
+                    drops["qc_unparsed"] += 1  # stage 04 ran but its QC output didn't parse: don't let it pass silently
+                    continue
                 if args.min_gameplay_frac > 0 and fg is not None and fg < args.min_gameplay_frac:
                     drops["non_gameplay"] += 1
+                    continue
+                if args.require_frame0_gameplay and scr and scr[0] != "gameplay":
+                    drops["frame0_not_gameplay"] += 1  # frame 0 is the caption/conditioning frame
                     continue
                 if split == "val_unseen_games" and row.video_id in leak_videos:
                     drops["val_leak"] += 1
@@ -188,6 +196,8 @@ def main():
                     "inpaint_boxes": meta.get("inpaint_boxes", []), "inpaint_frac": meta.get("inpaint_frac", 0.0),
                     "caption": cap or "", "vlm_perspective": meta.get("vlm_perspective"),
                     "vlm_is_2d": meta.get("vlm_is_2d"), "action_names": ACTION_NAMES,
+                    "vlm_frac_gameplay": meta.get("vlm_frac_gameplay"), "vlm_screens": meta.get("vlm_screens"),
+                    "vlm_game_title": meta.get("vlm_game_title"),
                     "action_source": meta.get("action_source"), "start_time": meta.get("start_time"),
                     "source_url": f"https://www.youtube.com/watch?v={row.video_id}",
                 }

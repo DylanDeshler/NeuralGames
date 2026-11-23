@@ -47,7 +47,8 @@ SCREENS = ["gameplay", "menu", "title", "loading", "cutscene", "map_or_inventory
 PROMPT = """You are given {n} frames, in order, sampled from one 20-second gameplay clip (IMAGE 1 is the first frame).
 They are used to train a generative video world model.
 
-1. caption: a concise 1-2 sentence visual prompt for IMAGE 1 that would let an artist recreate the scene. Cover the art
+1. caption: a concise 1-2 sentence visual prompt describing ONLY IMAGE 1 (ignore images 2-{n} for the caption) that would
+   let an artist recreate that exact scene. If IMAGE 1 is black, a menu or a title screen, describe exactly that. Cover the art
    style (pixel art, hand-drawn, painterly, cel-shaded, low-poly, realistic 3D...), camera perspective (side-scrolling,
    top-down, isometric, 3D), environment/biome, and the main player character's appearance and pose.
    NEVER mention HUD elements, health bars, score/coin counters, timers, minimaps, menus, text overlays, logos,

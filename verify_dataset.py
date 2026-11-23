@@ -148,7 +148,8 @@ def make_grid(items: list[dict], n_cols: int, path: Path) -> None:
         row = np.concatenate(tiles, 1)
         bar = np.zeros((44, row.shape[1], 3), np.uint8)
         m = it["meta"]
-        head = f"{m.get('game')} [{m.get('split')}] {m.get('uuid')}  fps={m.get('fps')}  T={T}"
+        head = (f"{m.get('game')} [{m.get('split')}] {m.get('uuid')}  fps={m.get('fps')}  T={T}  "
+                f"gameplay={m.get('vlm_frac_gameplay')} screens={m.get('vlm_screens')} vlm_title={m.get('vlm_game_title')!r}")
         cv2.putText(bar, head, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
         cap = textwrap.shorten(it["caption"], width=int(row.shape[1] / 6.2))
         cv2.putText(bar, cap, (4, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
