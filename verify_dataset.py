@@ -56,7 +56,7 @@ def decode_video(blob: bytes) -> np.ndarray:
         return np.stack([f.to_ndarray(format="rgb24") for f in c.decode(video=0)])
 
 
-def check_sample(key: str, s: dict, game_ids: dict) -> tuple[list[str], dict]:
+def check_sample(key: str, s: dict, game_ids: dict, allow_missing_caption: bool = False) -> tuple[list[str], dict]:
     errs = []
     for req in ("actions.npy", "txt", "json", "cls"):
         if req not in s:
@@ -103,8 +103,8 @@ def check_sample(key: str, s: dict, game_ids: dict) -> tuple[list[str], dict]:
     for b in meta.get("inpaint_boxes") or []:
         if len(b) != 4 or b[2] <= 0 or b[3] <= 0 or b[0] < 0 or b[1] < 0 or b[0] + b[2] > W or b[1] + b[3] > H:
             errs.append(f"bad inpaint box {b}")
-    if not s["txt"].decode().strip():
-        errs.append("empty caption")
+    if not s["txt"].decode().strip() and not allow_missing_caption:
+        errs.append("empty caption (run stage 04, or pass --allow-missing-caption)")
     gk = meta.get("game_key")
     if game_ids and gk in game_ids and int(s["cls"]) != game_ids[gk]:
         errs.append(f"cls {s['cls']} != game_ids[{gk}]={game_ids[gk]}")
@@ -186,6 +186,8 @@ def main():
     ap.add_argument("--debug-videos", type=int, default=2)
     ap.add_argument("--out-dir", default=str(DATA_ROOT / "debug"))
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--allow-missing-caption", action="store_true",
+                    help="don't fail samples without a caption (e.g. smoke tests before stage 04)")
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
@@ -215,7 +217,7 @@ def main():
             for key in keys:
                 if checked >= args.max_samples:
                     break
-                errs, it = check_sample(key, samples[key], game_ids)
+                errs, it = check_sample(key, samples[key], game_ids, args.allow_missing_caption)
                 checked += 1
                 if errs:
                     failed += 1
