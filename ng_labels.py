@@ -22,7 +22,7 @@ UNAVAILABLE_PATTERNS = re.compile(
     r"(private video|video unavailable|video is unavailable|is unavailable|has been removed|no longer available|"
     r"account associated|copyright|members-only|join this channel|confirm your age|is not available|terminated|"
     r"does not exist|deleted|404)", re.I)
-BOT_PATTERNS = re.compile(r"(not a bot|sign in to confirm|429|too many requests)", re.I)
+BOT_PATTERNS = re.compile(r"(not a bot|sign in to confirm|HTTP Error 429|too many requests)", re.I)
 
 
 class BotBlockedError(RuntimeError):
@@ -199,6 +199,7 @@ class YouTubeMeta:
                     pass
         self.lock, self.rate_lock, self.last = threading.Lock(), threading.Lock(), 0.0
         self.bot_streak, self.n_ok = 0, 0
+        self.sample_errors: list[str] = []
         self.opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
                      "socket_timeout": 30, "logger": _NullLogger()}
         if cookies:
@@ -235,9 +236,14 @@ class YouTubeMeta:
                         "availability": info.get("availability")}
             except Exception as e:
                 last = str(e)
-                if BOT_PATTERNS.search(last):
+                with self.lock:
+                    if len(self.sample_errors) < 5 and last[:120] not in self.sample_errors:
+                        self.sample_errors.append(last[:120])
+                if BOT_PATTERNS.search(last) and is_youtube(url):  # only YouTube bot checks count toward a block
                     with self.lock:
                         self.bot_streak += 1
+                    time.sleep(10 * (attempt + 1))
+                elif BOT_PATTERNS.search(last):
                     time.sleep(10 * (attempt + 1))
                 elif UNAVAILABLE_PATTERNS.search(last):
                     return {"video_id": vid, "status": "unavailable", "source_url": url, "error": last[:300]}
@@ -281,7 +287,8 @@ class YouTubeMeta:
                             "via": "api"}) for v in vids]
 
     # ------------------------------------------------------------------ public
-    def get_many(self, vids: list[str], urls: dict[str, str] | None = None) -> dict[str, dict]:
+    def get_many(self, vids: list[str], urls: dict[str, str] | None = None, strict: bool = False) -> dict[str, dict]:
+        """Fetch missing metadata. On a bot block: raise if strict, else warn and return what's cached."""
         urls = urls or {}
         todo = [v for v in dict.fromkeys(vids) if self.cache.get(v, {}).get("status") not in ("ok", "unavailable")]
         if todo:
@@ -310,10 +317,19 @@ class YouTubeMeta:
                                 save(r)
                             if self.bot_streak >= self.max_bot_streak:
                                 ex.shutdown(wait=False, cancel_futures=True)
-                                raise BotBlockedError(
+                                err = BotBlockedError(
                                     f"YouTube is bot-blocking this IP ({self.bot_streak} consecutive 'confirm you're "
                                     f"not a bot' errors, {self.n_ok} successes). Progress is cached. Fix one of:\n"
                                     "  * --yt-backend api --yt-api-key KEY   (YouTube Data API v3; recommended for metadata)\n"
                                     "  * --cookies cookies.txt               (exported from a logged-in browser)\n"
                                     "  * run this step from a residential IP and copy yt_meta_cache.jsonl over")
+                                if strict:
+                                    raise err
+                                self.log.warning("%s\nContinuing with the metadata already cached.", err)
+                                break
+                if self.sample_errors:
+                    self.log.info("Sample yt-dlp errors: %s", " || ".join(self.sample_errors))
+                n_fail = sum(self.cache.get(v, {}).get("status") not in ("ok", "unavailable") for v in todo)
+                if n_fail:
+                    self.log.warning("%d videos still without metadata (retried on the next run)", n_fail)
         return {v: self.cache.get(v, {"status": "missing"}) for v in vids}

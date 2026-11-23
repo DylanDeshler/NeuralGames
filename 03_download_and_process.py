@@ -52,10 +52,10 @@ from tqdm import tqdm
 from ng_common import DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, free_gb, processed_dir_for, setup_logging
 
 PERMANENT_ERR = re.compile(
-    r"(private video|video unavailable|has been removed|no longer available|account associated|"
+    r"(private video|video unavailable|video is unavailable|does not exist|has been removed|no longer available|account associated|"
     r"copyright|members-only|join this channel|confirm your age|is not available|terminated|"
     r"This live event|premieres in)", re.I)
-RATE_ERR = re.compile(r"(429|too many requests|not a bot|rate.?limit)", re.I)
+RATE_ERR = re.compile(r"(HTTP Error 429|too many requests|not a bot|sign in to confirm|rate.?limit)", re.I)
 
 
 class PermanentError(Exception):
