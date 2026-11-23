@@ -209,13 +209,20 @@ class OpenAIBackend:
 def merge_into_manifest(manifest_path: str, processed_dir: str, log) -> None:
     man = pd.read_parquet(manifest_path)
     cols = {k: [] for k in ("caption", "vlm_perspective", "vlm_is_2d", "vlm_frac_gameplay", "vlm_game_title", "frame0_dark")}
+    present = []
     for v, u in zip(man.video_id, man.uuid):
         p = processed_dir_for(processed_dir, v, u) / "meta.json"
-        m = json.loads(p.read_text()) if p.exists() else {}
+        m = json.loads(p.read_text()) if p.exists() else None
+        present.append(m is not None)
         for k in cols:
-            cols[k].append(m.get(k))
+            cols[k].append(m.get(k) if m else None)
+    present = np.array(present)
     for k, vals in cols.items():
-        man[k] = vals
+        new = pd.Series(vals, index=man.index, dtype=object)
+        if k in man.columns:  # keep earlier values for clips whose dirs were deleted after packing
+            man[k] = man[k].astype(object).where(~present, new)
+        else:
+            man[k] = new.where(present, None)
     atomic_write_parquet(man, manifest_path)
     c = man["caption"].notna()
     fg = pd.to_numeric(man.loc[c, "vlm_frac_gameplay"], errors="coerce")
@@ -291,7 +298,8 @@ def main():
                     r = parse_output(text, len(ims))
                     n_bad += not r["parse_ok"]
                     scr = r["screens"]
-                    frac_gp = (sum(s == "gameplay" for s in scr) / len(scr)) if scr else None
+                    # fewer labels than half the frames = unreliable QC -> None (stage 05 counts it as unparsed)
+                    frac_gp = (sum(s == "gameplay" for s in scr) / len(scr)) if len(scr) >= max(1, (len(ims) + 1) // 2) else None
                     n_nongp += frac_gp is not None and frac_gp < 0.75
                     m.update(caption=r["caption"], vlm_perspective=r["perspective"], vlm_is_2d=r["is_2d"],
                              vlm_screens=scr, vlm_frac_gameplay=frac_gp, vlm_game_title=r["game_title"],

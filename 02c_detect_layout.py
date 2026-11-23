@@ -50,13 +50,17 @@ decorative borders or a blurred/zoomed copy of the game used as a background.
 
 Return JSON only:
 {"game_box": [x1, y1, x2, y2],
+ "layout_panels": [[x1, y1, x2, y2], ...],
  "overlays_in_game": [[x1, y1, x2, y2], ...],
  "screen": "gameplay|menu|title|loading|cutscene|map_or_inventory|black|not_a_game",
  "is_stream_layout": true|false}
 
-- game_box: the rectangle of the actual game screen only (exclude webcam, chat, panels, borders, background blur).
-  If the game fills the whole frame, return the full frame.
-- overlays_in_game: webcam / chat / logo / input-display boxes that sit ON TOP of the game screen (may be empty).
+- game_box: the rectangle of the actual game screen only. It must EXCLUDE chat columns, webcam frames, stream
+  status/ticker bars (streamer name, donation goals, follower counts, clocks), decorative borders/bezels and
+  blurred backgrounds. If the game fills the whole frame, return the full frame.
+- layout_panels: every non-game region of the frame (chat, webcam, status/ticker bar, borders, bezels), one box each.
+- overlays_in_game: small webcam / logo / input-display boxes that sit ON TOP of the game picture (often empty).
+  Never return the whole game screen here, and do not list the game's own HUD (health bars, score, minimap).
 - Coordinates are pixels in this image ({w}x{h})."""
 
 
@@ -98,7 +102,15 @@ def parse(text: str, w: int, h: int) -> dict | None:
     g = box(d.get("game_box"))
     if g is None:
         return None
-    ovs = [b for b in (box(o) for o in (d.get("overlays_in_game") or [])) if b is not None]
+    raw = list(d.get("overlays_in_game") or []) + list(d.get("layout_panels") or [])
+    ovs = []
+    for b in (box(o) for o in raw):
+        if b is None:
+            continue
+        area = (b[2] - b[0]) * (b[3] - b[1])
+        if area > 0.6:  # "overlay" covering most of the frame = the model echoing the game screen: ignore
+            continue
+        ovs.append(b)
     return {"game": g, "overlays": ovs, "screen": str(d.get("screen", "")).lower(),
             "stream": bool(d.get("is_stream_layout", False))}
 
@@ -193,7 +205,10 @@ def aggregate(results: list[dict], full_thresh: float) -> dict:
         elif o[3] >= g[3] - 0.03 and w_span >= 0.6 and o[1] > g[1] + 0.5 * (g[3] - g[1]):
             g[3] = min(g[3], o[1])
         else:
-            inner.append(o)
+            gw, gh = max(g[2] - g[0], 1e-6), max(g[3] - g[1], 1e-6)
+            frac = (o[2] - o[0]) * (o[3] - o[1]) / (gw * gh)
+            if 0.025 <= frac <= 0.30:  # webcam-sized: inpaint. Tiny = HUD bits; huge = not an overlay
+                inner.append(o)
     keep = inner
     area = (g[2] - g[0]) * (g[3] - g[1])
     full = (g[0] <= 1 - full_thresh and g[1] <= 1 - full_thresh and g[2] >= full_thresh and g[3] >= full_thresh)

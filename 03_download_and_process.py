@@ -314,6 +314,9 @@ def build_mask(boxes_src, crop_src, ana_wh, borders, geo, dilate: int):
     mask = np.zeros((H, W), np.uint8)
     out = []
     for bx, by, bw, bh in boxes_src:
+        if bw * bh > 0.35 * cw * ch:  # backstop: never inpaint most of the picture (bad box upstream)
+            continue
+
         def tx(x):
             return ((x - x0) * kx - L) * fx + geo["ox"]
 

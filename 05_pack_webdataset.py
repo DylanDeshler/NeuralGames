@@ -94,6 +94,9 @@ def main():
                     help="drop clips where more than this fraction of frames is near-black (fades, loading)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--append", action="store_true",
+                    help="add newly processed clips to existing shards (new shard files; already-packed uuids skipped). "
+                         "Use with --delete-processed for repeated download/pack cycles")
     ap.add_argument("--delete-processed", action="store_true",
                     help="delete each processed clip dir once the shard containing it is closed (halves peak disk; "
                          "processed/ can't be re-packed afterwards)")
@@ -117,17 +120,27 @@ def main():
 
     for split in args.splits:
         sdir = out / split
-        if (sdir / "index.json").exists() and not args.overwrite:
-            log.info("[%s] already packed (index.json exists) — skipping", split)
-            continue
-        shutil.rmtree(sdir, ignore_errors=True)
-        sdir.mkdir(parents=True)
+        prev_index = json.loads((sdir / "index.json").read_text()) if (sdir / "index.json").exists() else None
+        packed_path = sdir / "_packed_uuids.txt"
+        if args.append:
+            sdir.mkdir(parents=True, exist_ok=True)
+            already = set(packed_path.read_text().split()) if packed_path.exists() else set()
+        else:
+            if prev_index and not args.overwrite:
+                log.info("[%s] already packed (index.json exists) — skipping (use --append or --overwrite)", split)
+                continue
+            shutil.rmtree(sdir, ignore_errors=True)
+            sdir.mkdir(parents=True)
+            already, prev_index = set(), None
         sm = man[man.split == split]
+        if already:
+            sm = sm[~sm["uuid"].isin(already)]
         # shuffle so each shard mixes games (important for streaming training)
         sm = sm.sample(frac=1.0, random_state=args.seed)
         drops = {"not_processed": 0, "no_caption": 0, "vlm_3d": 0, "dark": 0, "black_frames": 0,
                  "non_gameplay": 0, "qc_unparsed": 0, "frame0_not_gameplay": 0, "val_leak": 0, "bad_shape": 0}
         stats: dict[str, dict] = {}   # bucket -> {samples, frames, hours, width, height}
+        newly_packed: list[str] = []
         writers: dict[str, "wds.ShardWriter"] = {}
         pending_del: dict[str, list[Path]] = {}  # bucket -> clip dirs whose shard is still open
         n_deleted = 0
@@ -187,9 +200,11 @@ def main():
                 bucket = meta.get("bucket", f"{meta['width']}x{meta['height']}px")
                 if bucket not in writers:  # one shard series per aspect bucket -> same-shape batches
                     (sdir / bucket).mkdir(parents=True, exist_ok=True)
+                    start = len(list((sdir / bucket).glob("*.tar")))  # append: continue numbering
                     writers[bucket] = wds.ShardWriter(str(sdir / bucket / f"{split}-{bucket}-%06d.tar"),
                                                       maxsize=int(args.shard_size_gb * 1e9),
-                                                      maxcount=args.max_samples_per_shard, verbose=0)
+                                                      maxcount=args.max_samples_per_shard, verbose=0,
+                                                      start_shard=start)
                     stats[bucket] = {"samples": 0, "frames": 0, "hours": 0.0, "width": meta["width"],
                                      "height": meta["height"], "patch": meta.get("patch")}
                 gid = int(game_ids[row.game_key])
@@ -226,6 +241,7 @@ def main():
                     if getattr(w, "shard", None) != shard_before and shard_before is not None:
                         flush_deletes(pending_del.setdefault(bucket, []))  # previous shard is closed on disk
                     pending_del.setdefault(bucket, []).append(d)
+                newly_packed.append(row.uuid)
                 st = stats[bucket]
                 st["samples"] += 1
                 st["frames"] += int(meta["n_frames"])
@@ -237,6 +253,17 @@ def main():
             for dirs in pending_del.values():
                 flush_deletes(dirs)
             log.info("[%s] deleted %s processed clip dirs after packing", split, f"{n_deleted:,}")
+        if newly_packed:  # record what's in the shards (append mode skips these next time)
+            with open(packed_path, "a") as fh:
+                fh.write("\n".join(newly_packed) + "\n")
+        if prev_index and args.append:  # merge with what earlier runs packed
+            for b, old in (prev_index.get("buckets") or {}).items():
+                st = stats.setdefault(b, {"samples": 0, "frames": 0, "hours": 0.0, "width": old["width"],
+                                          "height": old["height"], "patch": old.get("patch")})
+                for k in ("samples", "frames", "hours"):
+                    st[k] += old.get(k, 0)
+            for k, v in (prev_index.get("drops") or {}).items():
+                drops[k] = drops.get(k, 0) + (v if k != "not_processed" else 0)
         for b, st in stats.items():
             st["shards"] = sorted(f"{b}/{p.name}" for p in (sdir / b).glob("*.tar"))
             st["hours"] = round(st["hours"], 2)

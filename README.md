@@ -83,6 +83,20 @@ YouTube often answers datacenter IPs with "Sign in to confirm you're not a bot".
 * Both stages stop early with a clear message after repeated bot checks (`--max-bot-streak`) instead
   of grinding. Progress is cached, so just re-run once access is fixed.
 
+## One command: `run_pipeline.py`
+After stages 01, 02b and 02 (metadata, LLM labels, manifest), the download/processing stages run together:
+```bash
+python run_pipeline.py smoke --proxy http://127.0.0.1:8899     # ~20 clips in $NG_DATA_ROOT/smoke/, ends with smoke_results.tgz
+python run_pipeline.py bulk  --proxy http://127.0.0.1:8899 --workers 8 --min-free-gb 60
+```
+* **smoke** uses an isolated copy of the manifest and its own processed/shard dirs, so it never touches
+  bulk outputs. It runs 02c (first 40 videos) → 03 (`--clips 20`) → 04 → 05 → verify → inspect, then
+  bundles the debug grids, debug videos, `verify.txt`, `inspect.txt` and name mismatches into one tarball.
+* **bulk** runs 02c for every video (resumable), then repeats `03 --limit --cycle-clips` (20k clips, ~110 h)
+  → `04` → `05 --append --delete-processed` until the manifest is done, the disk floor is reached, or
+  downloads stop. Stop it any time (Ctrl-C) and re-run the same command to resume.
+* `--resample` re-runs stage 02 first, `--skip-layout` skips 02c, and `--dry-run` prints the commands.
+
 ## Step by step
 
 ### 1. Metadata sync
