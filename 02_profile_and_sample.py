@@ -259,7 +259,7 @@ def print_plan(d2: pd.DataFrame, targets: list[float], args, reports: Path, log)
               f"{r['download_tb']:>6.1f}")
     print("=" * 118)
     print(f" disk = processed 256px clips @ {args.est_disk_gb_per_hour} GB/h (x2 while webdataset shards coexist); "
-          f"download = source video @ {args.est_download_gb_per_hour} GB/h (720p60). Rough estimates.")
+          f"download = source video @ {args.est_download_gb_per_hour} GB/h (480p30 default). Rough estimates.")
     print(f" Per-game hours for every target: {reports / 'allocation_per_game.csv'}")
     print(" Next: re-run with --target-hours <H> [--allocation power|cap] (or --alpha <a>) to write the manifest.")
 
@@ -285,6 +285,32 @@ def largest_remainder(weights: np.ndarray, total: int, caps: np.ndarray) -> np.n
             remaining -= add.sum()
         active = alloc < caps
     return alloc
+
+
+def _spread_order(n: int) -> np.ndarray:
+    """Order 0..n-1 so every prefix is spread evenly over the range (bit-reversal / van der Corput)."""
+    if n <= 1:
+        return np.arange(n)
+    bits = int(np.ceil(np.log2(n)))
+    rev = np.array([int(format(i, f"0{bits}b")[::-1], 2) for i in range(1 << bits)])
+    return rev[rev < n]
+
+
+def download_priority(sel: pd.DataFrame, rng: np.random.Generator) -> pd.Series:
+    """Priority (hours) such that processing chunks in ascending order makes EVERY prefix a water-filling
+    ('cap') allocation: each game's chunks are ranked (round-robin over its videos, spread along each video's
+    timeline) and priority = that game's cumulative hours up to and including the chunk."""
+    prio = pd.Series(np.nan, index=sel.index)
+    for _, g in sel.groupby("game_key"):
+        per_vid = []
+        for _, v in g.groupby("video_id"):
+            idx = v.sort_values("chunk_id").index.to_numpy()
+            per_vid.append(list(idx[_spread_order(len(idx))]))
+        rng.shuffle(per_vid)
+        per_vid.sort(key=len, reverse=True)
+        order = [lst[i] for i in range(max(map(len, per_vid))) for lst in per_vid if i < len(lst)]
+        prio.loc[order] = np.cumsum(sel.loc[order, "duration"].to_numpy()) / 3600
+    return prio + rng.uniform(0, 1e-6, len(prio))  # random tie-break across games
 
 
 def select_within_game(gdf: pd.DataFrame, quota: int, rng: np.random.Generator) -> np.ndarray:
@@ -399,7 +425,8 @@ def main():
     ap.add_argument("--allocation", choices=["power", "cap"], default="power",
                     help="power: floor(n_g**alpha) solved for --target-hours; cap: per-game hour cap solved for it")
     ap.add_argument("--est-disk-gb-per-hour", type=float, default=0.3)
-    ap.add_argument("--est-download-gb-per-hour", type=float, default=1.8)
+    ap.add_argument("--est-download-gb-per-hour", type=float, default=0.6,
+                    help="source download per hour of data (~0.6 GB at 480p30, ~1.8 GB at 720p60)")
     ap.add_argument("--val-frac", type=float, default=0.10, help="fraction of games held out")
     ap.add_argument("--val-max-hours-pct", type=float, default=90.0,
                     help="only games at or below this percentile of hours are eligible for holdout")
@@ -423,6 +450,11 @@ def main():
 
     # ---------------------------------------------------------------- labeling
     lab = GameLabeler(Path(args.genres), Path(args.labels_csv) if args.labels_csv else None)
+    junk = df["game"].map(lab.is_junk_slug)
+    if junk.any():
+        log.info("Junk/chapter slugs treated as 'other': %d slugs, %.0f h (e.g. %s)", df.loc[junk, "game"].nunique(),
+                 df.loc[junk, "duration"].sum() / 3600, ", ".join(df.loc[junk, "game"].value_counts().index[:6]))
+        df.loc[junk, "game"] = "other"
     slug_lab = {g: lab.label_slug(g) for g in df["game"].unique()}
     df["status"] = df["game"].map(lambda g: slug_lab[g][0])
     df["genre"] = df["game"].map(lambda g: slug_lab[g][1])
@@ -445,7 +477,7 @@ def main():
         order = df[df["video_id"].isin(unk_vids)].groupby("video_id")["duration"].sum().sort_values(ascending=False)
         unk_vids = order.index.tolist()[: args.yt_max_videos or None]
         meta = yt.get_many(unk_vids, urls)
-        vid_update, unk_slug_votes = {}, defaultdict(Counter)
+        vid_update, unk_slug_votes, slug_hit_keys = {}, defaultdict(Counter), defaultdict(set)
         slug_of_vid = df.drop_duplicates("video_id").set_index("video_id")["game"].to_dict()
         for v in unk_vids:
             m = meta.get(v, {})
@@ -456,12 +488,13 @@ def main():
             text = " | ".join([m.get("title") or "", " ".join(m.get("tags") or [])])
             hit = lab.match_text(text) or lab.match_text((m.get("description") or "")[:300])
             slug = slug_of_vid[v]
-            if slug != "other":  # named but unlisted slug: collect votes per game
+            if slug != "other":  # named but unlisted slug: per-video hits win, the rest may be labeled by vote
                 if hit:
                     unk_slug_votes[slug][hit[0]] += 1
+                    slug_hit_keys[slug].add(hit[1])
                 else:
                     unk_slug_votes[slug][{1: "kw2d", -1: "kw3d", 0: "none"}[lab.keyword_vote(text + " " + (m.get("description") or ""))]] += 1
-                continue
+                    continue
             if hit:
                 status, key, _ = hit
                 if status == "2d":
@@ -471,14 +504,22 @@ def main():
                     vid_update[v] = ("3d", "", "youtube_title", key, lab.title_3d[key])
             elif args.keyword_fallback and lab.keyword_vote(text + " " + (m.get("description") or "")) > 0:
                 vid_update[v] = ("2d", "2D (keyword)", "youtube_keywords", f"unk:{v}", f"unk:{v}")
+        n_multi = 0
         for slug, votes in unk_slug_votes.items():
+            if len(slug_hit_keys[slug]) >= 2:  # titles name different games -> chapter/junk slug: no slug-level vote
+                n_multi += 1
+                continue
             n = sum(votes.values())
+            rest = (df["game"] == slug) & ~df["video_id"].isin(vid_update)  # videos without their own title hit
             if votes["2d"] / n > 0.5 or (args.keyword_fallback and (votes["2d"] + votes["kw2d"]) / n > 0.6
                                          and votes["3d"] + votes["kw3d"] == 0):
-                m = df["game"] == slug
-                df.loc[m, ["status", "genre", "label_source"]] = ["2d", "2D (youtube vote)", "youtube_vote"]
+                df.loc[rest, ["status", "genre", "label_source"]] = ["2d", "2D (youtube vote)", "youtube_vote"]
+                if slug_hit_keys[slug]:  # consistent single game: use its canonical key/name
+                    k = next(iter(slug_hit_keys[slug]))
+                    df.loc[rest, ["game_key", "game_name"]] = [k, lab.title_2d.get(k, (k,))[0]]
             elif (votes["3d"] + votes["kw3d"]) / n > 0.5:
-                df.loc[df["game"] == slug, ["status", "label_source"]] = ["3d", "youtube_vote"]
+                df.loc[rest, ["status", "label_source"]] = ["3d", "youtube_vote"]
+        log.info("Slug votes: %d named slugs looked multi-game (left per-video)", n_multi)
         if vid_update:
             upd = pd.DataFrame.from_dict(vid_update, orient="index",
                                          columns=["u_status", "u_genre", "u_src", "u_key", "u_name"])
@@ -604,6 +645,7 @@ def main():
     for key, gdf in tqdm(d2.groupby("game_key"), desc="sampling games"):
         picked.append(select_within_game(gdf, int(stats.at[key, "quota"]), rng))
     sel = d2.loc[np.concatenate(picked)].copy()
+    sel["download_priority"] = download_priority(sel, rng)
 
     # ---------------------------------------------------------------- holdout split (by game)
     sg = per_game_table(sel)

@@ -502,3 +502,16 @@ game_groups:
   "Hotline Miami": ["Hotline Miami 2", "Hotline Miami 2: Wrong Number"]
   "Ori and the Blind Forest": []
   "Blasphemous": []
+
+# NitroGen `game` values that are YouTube chapter / stream markers rather than games. Matching videos
+# are treated like game == "other" (identified per video). Python regexes, matched case-insensitively.
+junk_slugs:
+  - "^_*untitled"
+  - "chapter|capitulo|cap_tulo|kapitel"
+  - "inscreva|subscribe|deixa_o_like|like_and"
+  - "^just_chatting|^chatting|^talking"
+  - "^gameplay|^intro$|^outro$|^setup$|^controls$|^start$|^start_of|^starting|^stream|^twitch_plays$|^vod"
+  - "^game_?\\d+$|^part_?\\d+$|^level_?\\d+$|^episode"
+  - "^retro$|^special_events$|^games___demos$|^games$|^misc"
+  - "mic_is_on|unmuted|muted_section|matches_start|gameplay_starts|in_cio_do_jogo|início"
+  - "pc_specs|tier_list|stream_time_marker"

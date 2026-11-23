@@ -421,9 +421,13 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
     url = row.url if isinstance(row.url, str) and row.url else f"https://www.youtube.com/watch?v={row.video_id}"
     # small embedded game areas need a higher-res source to survive the crop
     ga = _jload(row.bbox_game_area)
-    cap = args.max_src_height
-    if isinstance(ga, dict) and (ga.get("ybr", 1) - ga.get("ytl", 0)) < 0.6:
-        cap = max(cap, 1080)
+    # need the game content to be >= ~1.5x the output bucket height after cropping bbox_game_area
+    frac_h = (ga.get("ybr", 1) - ga.get("ytl", 0)) if isinstance(ga, dict) else 1.0
+    frac_w = (ga.get("xbr", 1) - ga.get("xtl", 0)) if isinstance(ga, dict) else 1.0
+    rw, rh = float(row.res_w or 1920) * frac_w, float(row.res_h or 1080) * frac_h  # content size (metadata)
+    out_h = choose_bucket(max(rw, 1), max(rh, 1), args.bucket_list, args.patch, args.max_crop)["H"]
+    need = 1.5 * out_h / max(frac_h, 0.1)  # source height so the cropped content is >= 1.5x the output
+    cap = int(min(1080, max(args.max_src_height, next((r for r in (360, 480, 720, 1080) if r >= need), 1080))))
 
     tmp = Path(args.tmp_dir) / row.uuid
     shutil.rmtree(tmp, ignore_errors=True)
@@ -436,7 +440,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
         last_err = None
         for method in methods:
             try:
-                fmt = format_selector(fps_ann, cap)
+                fmt = format_selector(fps_out, cap)  # only need >= output fps (e.g. 30), not the 60 fps annotation
                 if method == "direct":
                     info = resolver.resolve(row.video_id, url, fmt, cap, limiter)
                     if not info.get("width") or not info.get("height"):
@@ -569,6 +573,12 @@ def print_status(man: pd.DataFrame, args) -> None:
           f"permanently failed {perm.sum():,} | pending {(~done & ~perm).sum():,}")
     for sp, sdf in man.assign(done=done).groupby("split"):
         print(f"  {sp:<18} done {sdf.done.sum():>7,} / {len(sdf):>7,}")
+    if done.any():
+        h = man[done].groupby("game_key")["duration"].sum() / 3600
+        p = (h / h.sum()).to_numpy()
+        cap = man.loc[done, "download_priority"].max() if "download_priority" in man.columns else float("nan")
+        print(f"  downloaded subset: {len(h)} games, eff_games {np.exp(-(p * np.log(p)).sum()):.1f}, "
+              f"top game {p.max():.1%}, per-game cap reached ≈ {cap:.1f} h")
     print(f"  disk used: {shutil.disk_usage(args.processed_dir).used / 1e9:.0f} GB (volume), "
           f"free {free_gb(args.processed_dir):.0f} GB")
 
@@ -588,7 +598,9 @@ def main():
     ap.add_argument("--retries", type=int, default=3)
     ap.add_argument("--retry-failed", action="store_true", help="retry chunks marked permanently failed")
     ap.add_argument("--method", choices=["auto", "direct", "sections"], default="auto")
-    ap.add_argument("--max-src-height", type=int, default=720, help="source resolution cap (1080 for small game areas)")
+    ap.add_argument("--max-src-height", type=int, default=480,
+                    help="source resolution cap. 480p is >= 2x the default buckets and ~1/3 the bytes of 720p60; raised "
+                         "automatically (up to 1080) when bbox_game_area is a small part of the frame")
     ap.add_argument("--patch", type=int, default=16, help="model patch size in px; buckets are in patch units")
     ap.add_argument("--buckets", default=DEFAULT_BUCKETS,
                     help="'auto' (canonical game aspects + gap fillers, ~256 tokens each) or an explicit "
@@ -640,7 +652,11 @@ def main():
     if args.split != "all":
         man = man[man.split == args.split]
     # interleave games so early progress covers many titles (and spreads load across videos)
-    man = man.sample(frac=1.0, random_state=0).reset_index(drop=True)
+    if "download_priority" in man.columns:
+        # balanced-first order: any prefix of the run is a per-game-capped ("water-filling") subset
+        man = man.sort_values("download_priority").reset_index(drop=True)
+    else:
+        man = man.sample(frac=1.0, random_state=0).reset_index(drop=True)
     Path(args.processed_dir).mkdir(parents=True, exist_ok=True)
     if args.status:
         print_status(man, args)

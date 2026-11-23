@@ -140,6 +140,14 @@ Two strategies:
 At "everything" the two are the same. The script also writes `reports/allocation_per_game.csv`
 (hours per game for every target and strategy) and `reports/idle_filter_sensitivity.csv`.
 `--target-hours` is required outside `--plan`, so nothing is sampled until you've chosen.
+
+**Balanced-first download order.** The manifest has a `download_priority` column (a game's cumulative
+hours up to and including that chunk), and stage 03 processes chunks in that order. **Any prefix
+of the download is therefore a per-game-capped ("water-filling") subset.** If you sample generously
+(even `--target-hours 1e9` = everything) and stop stage 03 whenever bandwidth or YouTube access runs out,
+what you have is already balanced. `03_download_and_process.py --status` reports the downloaded
+subset's game count, `eff_games`, top-game share, and the per-game cap reached so far. Per-game
+re-weighting can also be done at training time with sampling weights.
 * **2D labeling** runs in this precedence order: `config/game_labels.csv` → `exclude_3d` →
   `games_2d` (`config/genres_2d.yaml`) → YouTube title/tags/description match for `"other"` and
   unknown slugs (`--enrich-youtube`, cached in `data/yt_meta_cache.jsonl`) → LLM labels from
@@ -197,6 +205,9 @@ python 03_download_and_process.py --status
   video is H.264 yuv444p at CRF 10. Use `--enc-args "-preset veryslow -crf 0 -pix_fmt yuv444p"` for
   lossless, or `--vcodec h264_nvenc --enc-args "-preset p7 -tune hq -rc constqp -qp 10 -pix_fmt yuv444p"`
   to encode on the GPU.
+* Source resolution defaults to **480p30** (`--max-src-height 480`): ≥1.5× the output bucket, and about a
+  third of the bytes of 720p60. It's raised automatically, up to 1080p, when `bbox_game_area` is a small part
+  of the frame. Format selection only requires ≥ the output fps, not the 60 fps annotation rate.
 * `--target-fps 30` (default) picks an integer stride per chunk (60→30 uses 2, 30→30 uses 1). Actions
   are pooled over each window: sticks are averaged, buttons are OR'd, so a 2-frame tap survives.
   Pooling composes, so you can go 30→15 at load time with the same rule. Stage 02's default `--fps 30 60`

@@ -103,6 +103,7 @@ class GameLabeler:
                     self.alias_phr.append((" " + " ".join(words) + " ", status, k))
         self.alias_phr.sort(key=lambda x: -len(x[0]))
         self.ambiguous = {norm_title(t) for t in cfg.get("ambiguous_titles") or []}
+        self.junk_re = re.compile("|".join(cfg.get("junk_slugs") or ["$^"]), re.I)
         # titles that should count as ONE game for grouping / unseen-game holdout
         self.group_of = {norm_title(t): norm_title(canon) for canon, ts in (cfg.get("game_groups") or {}).items()
                          for t in [canon, *(ts or [])]}
@@ -126,6 +127,10 @@ class GameLabeler:
                     return "2d", self.title_2d[hit[1]][1], "slug_match"
                 return "3d", "", "slug_match"
         return "unknown", "", ""
+
+    def is_junk_slug(self, game: str) -> bool:
+        """NitroGen 'game' values that are stream/chapter markers, not games (treated like 'other')."""
+        return bool(game) and game != "other" and bool(self.junk_re.search(game))
 
     def canonical_key(self, game: str) -> str:
         """Game key used for grouping/holdout: the matched curated title if the slug contains one,
