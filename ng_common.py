@@ -247,3 +247,23 @@ def _json_default(o):
 
 def processed_dir_for(processed_root: str | Path, video_id: str, uuid: str) -> Path:
     return Path(processed_root) / video_id / uuid
+
+
+# ----------------------------------------------------------------------------- VLM / LLM helpers
+DEFAULT_VLM = "Qwen/Qwen3.8-27B-FP8"   # native image+video model; fits a 48 GB GPU in FP8
+
+
+def vllm_chat_kwargs(model: str) -> dict:
+    """Qwen3.x models think by default: disable it for short structured answers."""
+    return {"chat_template_kwargs": {"enable_thinking": False}} if "qwen3" in model.lower() else {}
+
+
+def vllm_mm_kwargs(model: str, max_pixels: int) -> dict:
+    """min/max_pixels are Qwen2.5-VL processor options; newer Qwen processors use their own defaults."""
+    if "qwen2.5-vl" in model.lower() or "qwen2_5" in model.lower():
+        return {"mm_processor_kwargs": {"min_pixels": 64 * 28 * 28, "max_pixels": max_pixels}}
+    return {}
+
+
+def strip_thinking(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)

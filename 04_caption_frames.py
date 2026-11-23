@@ -40,9 +40,10 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from ng_common import DATA_ROOT, atomic_write_json, atomic_write_parquet, processed_dir_for, setup_logging
+from ng_common import (DATA_ROOT, DEFAULT_VLM, atomic_write_json, atomic_write_parquet, processed_dir_for, setup_logging,
+                       strip_thinking, vllm_chat_kwargs, vllm_mm_kwargs)
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
+DEFAULT_MODEL = DEFAULT_VLM
 SCREENS = ["gameplay", "menu", "title", "loading", "cutscene", "map_or_inventory", "black", "not_a_game"]
 PROMPT = """You are given {n} frames, in order, sampled from one 20-second gameplay clip (IMAGE 1 is the first frame).
 They are used to train a generative video world model.
@@ -103,7 +104,7 @@ def prompt_for(n: int) -> str:
 
 
 def parse_output(text: str, n_images: int = 1) -> dict:
-    text = (text or "").strip()
+    text = strip_thinking(text).strip()
     m = re.search(r"\{.*\}", text, re.S)
     if m:
         try:
@@ -135,15 +136,15 @@ class VLLMBackend:
         self.llm = LLM(model=args.model, max_model_len=args.max_model_len,
                        limit_mm_per_prompt={"image": max(1, args.qc_frames)},
                        tensor_parallel_size=args.tensor_parallel_size, gpu_memory_utilization=args.gpu_mem,
-                       mm_processor_kwargs={"min_pixels": 64 * 28 * 28, "max_pixels": args.max_pixels},
-                       dtype="bfloat16", seed=0, enforce_eager=args.enforce_eager)
+                       seed=0, enforce_eager=args.enforce_eager, **vllm_mm_kwargs(args.model, args.max_pixels))
         self.sp = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens)
+        self.chat_kw = vllm_chat_kwargs(args.model)
 
     def __call__(self, batch: list[list[Image.Image]]) -> list[str]:
         convs = [[{"role": "user", "content": [
             *({"type": "image_url", "image_url": {"url": to_data_uri(im)}} for im in ims),
             {"type": "text", "text": prompt_for(len(ims))}]}] for ims in batch]
-        outs = self.llm.chat(convs, self.sp, use_tqdm=False)
+        outs = self.llm.chat(convs, self.sp, use_tqdm=False, **self.chat_kw)
         return [o.outputs[0].text for o in outs]
 
 

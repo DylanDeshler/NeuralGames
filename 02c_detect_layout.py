@@ -38,32 +38,30 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from ng_common import DATA_ROOT, atomic_write_parquet, setup_logging
+from ng_common import (DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, setup_logging, strip_thinking, vllm_chat_kwargs,
+                       vllm_mm_kwargs)
 
 _spec = importlib.util.spec_from_file_location("stage03", Path(__file__).with_name("03_download_and_process.py"))
 S3 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(S3)
 
-PROMPT_GAME = """This is a frame from a gameplay video. It may be a livestream layout, where the game picture is only
-one rectangle of the frame and the rest is chat, a webcam, a status bar, borders or a background.
+# Native grounding-style prompts (the format Qwen-VL models are trained on: "Locate ..., output bbox coordinates in
+# JSON format" -> [{"bbox_2d": [x1, y1, x2, y2], "label": ...}]). The coordinate convention is whatever the model
+# natively uses; calibrate_coords() detects 0-1000 vs pixels at startup.
+PROMPT_GAME = ("Locate the game screen in this image: the rectangle where the video game itself is rendered (its world, "
+               "characters and the game's own HUD). Exclude livestream elements around it such as chat, webcam, status or "
+               "ticker bars, decorative borders and blurred backgrounds. If the game fills the whole image, the game "
+               "screen is the whole image. Output its bbox coordinates in JSON format with the label \"game screen\".")
 
-Find the rectangle that shows ONLY the game's own picture. Return JSON only:
-{"game_box": [x1, y1, x2, y2], "screen": "gameplay|menu|title|loading|cutscene|map_or_inventory|black|not_a_game"}
+PROMPT_LAYOUT = ("Locate every livestream or recording element in this image that is not part of the video game: chat panel, "
+                 "webcam, status bar (streamer name, donation or follower goals, counters, clock, social handles), "
+                 "decorative border, blurred background, alert, input display (on-screen controller). Do not include the "
+                 "game's own HUD (health bars, score, lives, minimap). Output bbox coordinates in JSON format, with the label "
+                 "set to one of: chat, webcam, status_bar, border, background, alert, input_display. Output [] if there are none.")
 
-The game picture is where the game world, its characters and its own HUD are drawn. Its edges are usually straight
-lines where the picture meets a chat column, a bar of text/icons, a frame, or a different background. If the game
-fills the entire frame, return the entire frame. Coordinates are pixels in this {w}x{h} image."""
-
-PROMPT_LAYOUT = """This is a frame from a gameplay video. List every livestream/recording element that is NOT part of
-the game itself. Return JSON only:
-{"elements": [{"type": "chat|webcam|status_bar|border|background|alert|input_display|logo|other", "box": [x1, y1, x2, y2]}, ...]}
-
-- chat: a column/panel of chat messages.  webcam: a camera image of a person.
-- status_bar: a strip with streamer name, donation/follower goals, counters, clock, social handles, emoji/icons.
-- border: decorative frame or bezel art around the game; background: blurred or decorative area outside the game.
-- input_display: an on-screen controller/keyboard showing pressed buttons.
-Do NOT list the game's own HUD (health bars, score, lives, minimap, timer drawn by the game).
-Return {"elements": []} if the game fills the frame with nothing else. Coordinates are pixels in this {w}x{h} image."""
+PROMPT_SCREEN = ("What is shown in this frame of a gameplay video? Answer with exactly one word from: gameplay, menu, title, "
+                 "loading, cutscene, map_or_inventory, black, not_a_game.")
+SCREENS = ["gameplay", "menu", "title", "loading", "cutscene", "map_or_inventory", "black", "not_a_game"]
 
 
 def fit28(w: int, h: int, long_side: int = 560) -> tuple[int, int]:
@@ -80,7 +78,7 @@ def to_data_uri(img: Image.Image) -> str:
 
 
 def _json(text: str):
-    m = re.search(r"\{.*\}", text or "", re.S)
+    m = re.search(r"\{.*\}", strip_thinking(text), re.S)
     if not m:
         return None
     try:
@@ -90,12 +88,16 @@ def _json(text: str):
 
 
 def _box(b, w: int, h: int):
+    """Box -> relative [0,1] coords. The prompt asks for 0-1000 normalized coordinates; if a model answers in
+    pixels anyway (values beyond 1000), interpret them in the image's pixel space (w, h)."""
     if not isinstance(b, (list, tuple)) or len(b) != 4:
         return None
     try:
         x1, y1, x2, y2 = (float(v) for v in b)
     except (TypeError, ValueError):
         return None
+    if max(x1, y1, x2, y2) <= 1000.5 and NORMALIZED:
+        w = h = 1000
     x1, x2 = sorted((min(max(x1, 0), w), min(max(x2, 0), w)))
     y1, y2 = sorted((min(max(y1, 0), h), min(max(y2, 0), h)))
     if x2 - x1 < 0.03 * w or y2 - y1 < 0.02 * h:
@@ -103,27 +105,66 @@ def _box(b, w: int, h: int):
     return [x1 / w, y1 / h, x2 / w, y2 / h]  # relative
 
 
+NORMALIZED = True  # prompts request 0-1000 coordinates (set False for models that only speak pixels)
 PANEL_TYPES = {"chat", "status_bar", "border", "background", "alert", "other", "logo"}
 OVERLAY_TYPES = {"webcam", "input_display", "logo", "alert"}
 
 
+def _grounding_items(text: str) -> list[dict] | None:
+    """Parse native grounding output: a JSON list of {"bbox_2d"|"bbox"|"box": [...], "label": ...} (possibly in a
+    ```json fence, or wrapped in an object). Returns None if nothing parseable."""
+    t = strip_thinking(text)
+    m = re.search(r"\[.*\]", t, re.S)
+    cand = None
+    if m:
+        try:
+            cand = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            cand = None
+    if cand is None:
+        d = _json(t)
+        if isinstance(d, dict):
+            cand = d.get("elements") or d.get("objects") or ([d] if any(k in d for k in ("bbox_2d", "bbox", "box", "game_box")) else [])
+    if not isinstance(cand, list):
+        return None
+    if cand and all(isinstance(v, (int, float)) for v in cand):  # a bare [x1, y1, x2, y2]
+        cand = [{"bbox_2d": cand}]
+    out = []
+    for it in cand:
+        if isinstance(it, dict):
+            b = it.get("bbox_2d") or it.get("bbox") or it.get("box") or it.get("game_box")
+            if b is not None:
+                out.append({"box": b, "label": str(it.get("label", "")).lower().strip()})
+    return out
+
+
 def parse_game(text: str, w: int, h: int) -> dict | None:
-    d = _json(text)
-    g = _box(d.get("game_box"), w, h) if isinstance(d, dict) else None
-    return {"game": g, "screen": str(d.get("screen", "")).lower()} if g else None
+    items = _grounding_items(text)
+    if not items:
+        return None
+    boxes = [b for b in (_box(i["box"], w, h) for i in items) if b is not None]
+    if not boxes:
+        return None
+    g = max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))  # if several, the largest is the game screen
+    return {"game": g, "screen": ""}
 
 
 def parse_layout(text: str, w: int, h: int) -> list[tuple[str, list[float]]] | None:
-    d = _json(text)
-    if not isinstance(d, dict) or not isinstance(d.get("elements"), list):
+    items = _grounding_items(text)
+    if items is None:
         return None
     out = []
-    for e in d["elements"]:
-        if isinstance(e, dict):
-            b = _box(e.get("box"), w, h)
-            if b and (b[2] - b[0]) * (b[3] - b[1]) <= 0.6:  # "element" covering most of the frame = the game itself
-                out.append((str(e.get("type", "other")).lower(), b))
+    for i in items:
+        b = _box(i["box"], w, h)
+        if b and (b[2] - b[0]) * (b[3] - b[1]) <= 0.6:  # an "element" covering most of the frame = the game itself
+            out.append((i["label"] or "other", b))
     return out
+
+
+def parse_screen(text: str) -> str:
+    t = strip_thinking(text).lower()
+    hits = [(t.find(s_), s_) for s_ in SCREENS if s_ in t]
+    return min(hits)[1] if hits else ""
 
 
 def parse(text: str, w: int, h: int) -> dict | None:
@@ -140,14 +181,38 @@ def parse(text: str, w: int, h: int) -> dict | None:
             "stream": bool(d.get("is_stream_layout", False))}
 
 
-def combine(game: dict | None, elements: list | None) -> dict | None:
+def calibrate_coords(llm, sp, chat_kw, log) -> bool:
+    """Ask the model for the box of a white rectangle at a known spot in a 576x320 image and decide whether it
+    answers in 0-1000 normalized coordinates (as instructed) or in pixels. Returns NORMALIZED."""
+    w, h = 576, 320
+    img = Image.new("RGB", (w, h), (0, 0, 0))
+    img.paste((255, 255, 255), (288, 40, 560, 280))  # normalized ~ [500, 125, 972, 875]; pixels = [288, 40, 560, 280]
+    q = 'Locate the white rectangle in this image, output its bbox coordinates in JSON format.'
+    out = llm.chat([[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": to_data_uri(img)}},
+                                                  {"type": "text", "text": q}]}]], sp, use_tqdm=False, **chat_kw)
+    items = _grounding_items(out[0].outputs[0].text) or []
+    b = items[0]["box"] if items else None
+    try:
+        x1, y1, x2, y2 = (float(v) for v in b)
+    except (TypeError, ValueError):
+        log.warning("Coordinate calibration unparsable (%r); assuming 0-1000 normalized", out[0].outputs[0].text[:120])
+        return True
+    err_norm = abs(x1 - 500) + abs(y1 - 125) + abs(x2 - 972) + abs(y2 - 875)
+    err_px = abs(x1 - 288) + abs(y1 - 40) + abs(x2 - 560) + abs(y2 - 280)
+    normalized = err_norm <= err_px
+    log.info("Coordinate calibration: model answered %s -> using %s coordinates", [x1, y1, x2, y2],
+             "0-1000 normalized" if normalized else "PIXEL")
+    return normalized
+
+
+def combine(game: dict | None, elements: list | None, screen: str = "") -> dict | None:
     """One frame: game box from the game question, refined by the elements from the layout question."""
     if game is None and elements is None:
         return None
     g = game["game"] if game else [0.0, 0.0, 1.0, 1.0]
     els = elements or []
     return {"game": g, "overlays": [b for _, b in els], "elements": els,
-            "screen": game["screen"] if game else "", "stream": bool(els) or g != [0.0, 0.0, 1.0, 1.0]}
+            "screen": screen or (game["screen"] if game else ""), "stream": bool(els) or g != [0.0, 0.0, 1.0, 1.0]}
 
 
 # ============================================================================ frame grabbing
@@ -269,8 +334,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=32, help="videos per VLM batch")
-    ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct",
-                    help="Qwen/Qwen2.5-VL-32B-Instruct-AWQ is noticeably better at layouts and fits a 48 GB GPU")
+    ap.add_argument("--model", default=DEFAULT_VLM,
+                    help="any vLLM-supported image model (default Qwen3.8-27B FP8, fits a 48 GB GPU)")
     ap.add_argument("--gpu-mem", type=float, default=0.85)
     ap.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     # network (same semantics as stage 03)
@@ -305,10 +370,13 @@ def main():
         return
 
     from vllm import LLM, SamplingParams
-    llm = LLM(model=args.model, max_model_len=4096, limit_mm_per_prompt={"image": 1}, dtype="bfloat16",
+    llm = LLM(model=args.model, max_model_len=8192, limit_mm_per_prompt={"image": 1},
               gpu_memory_utilization=args.gpu_mem, enforce_eager=args.enforce_eager, seed=0,
-              mm_processor_kwargs={"min_pixels": 64 * 28 * 28, "max_pixels": 640 * 28 * 28})
-    sp = SamplingParams(temperature=0.0, max_tokens=200)
+              **vllm_mm_kwargs(args.model, 640 * 28 * 28))
+    sp = SamplingParams(temperature=0.0, max_tokens=400)
+    chat_kw = vllm_chat_kwargs(args.model)
+    global NORMALIZED
+    NORMALIZED = calibrate_coords(llm, sp, chat_kw, log)
     resolver, limiter = S3.StreamResolver(args, log), S3.RateLimiter(args.max_starts_per_min)
     shutil.rmtree(args.tmp_dir, ignore_errors=True)
     rows = []
@@ -347,19 +415,20 @@ def main():
             for fi, f in enumerate(frames):
                 w, h = fit28(*f.size)
                 uri = to_data_uri(f.resize((w, h), Image.Resampling.BICUBIC))
-                for kind, prompt in (("game", PROMPT_GAME), ("layout", PROMPT_LAYOUT)):  # two focused questions
+                for kind, prompt in (("game", PROMPT_GAME), ("layout", PROMPT_LAYOUT), ("screen", PROMPT_SCREEN)):
                     convs.append([{"role": "user", "content": [
                         {"type": "image_url", "image_url": {"url": uri}},
-                        {"type": "text", "text": prompt.replace("{w}", str(w)).replace("{h}", str(h))}]}])
+                        {"type": "text", "text": prompt}]}])
                     owners.append((v, fi, kind, w, h))
-        outs = llm.chat(convs, sp, use_tqdm=False) if convs else []
+        outs = llm.chat(convs, sp, use_tqdm=False, **chat_kw) if convs else []
         answers: dict[tuple[str, int], dict] = {}
         for (v, fi, kind, w, h), o in zip(owners, outs):
             txt = o.outputs[0].text
-            answers.setdefault((v, fi), {})[kind] = parse_game(txt, w, h) if kind == "game" else parse_layout(txt, w, h)
+            answers.setdefault((v, fi), {})[kind] = (parse_game(txt, w, h) if kind == "game" else
+                                                     parse_layout(txt, w, h) if kind == "layout" else parse_screen(txt))
         per_vid: dict[str, list[dict]] = {}
         for (v, fi), a in sorted(answers.items()):
-            r = combine(a.get("game"), a.get("layout"))
+            r = combine(a.get("game"), a.get("layout"), a.get("screen") or "")
             if r:
                 per_vid.setdefault(v, []).append(r)
         for v, frames, err, method, secs in got:

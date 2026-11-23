@@ -10,7 +10,7 @@ can be resumed: re-running a stage skips work that's already done.
 02_profile_and_sample.py  2D filter, idle filter, alpha-sampling, game holdout -> manifest (CPU, minutes)
 02c_detect_layout.py      VLM finds the game screen inside stream layouts (chat/webcam), per video (GPU+net)
 03_download_and_process.py  20 s clip fetch, aspect bucket (no letterbox), inpaint, align (network-bound)
-04_caption_frames.py      Qwen2.5-VL caption of frame 0 (vLLM / transformers / OpenAI API) (GPU)
+04_caption_frames.py      VLM caption + gameplay QC per clip (Qwen3.8-27B FP8 via vLLM; transformers / OpenAI API) (GPU)
 05_pack_webdataset.py     ~1 GB WebDataset shards: train/ and val_unseen_games/
 verify_dataset.py         alignment/range assertions + visual debug grid & overlay videos
 ```
@@ -62,7 +62,7 @@ $NG_DATA_ROOT/
   manifest_2d.parquet  reports/                 stage 02
   processed/<video_id>/<uuid>/  tmp_03/         stage 03 (~0.10 GB per hour of data @ 15 fps, CRF 18)
   webdataset/{train,val_unseen_games}/          stage 05 (same size again; delete processed/ after verifying)
-  hf_cache/                                     Qwen2.5-14B (~30 GB) + Qwen2.5-VL-7B (~16 GB)
+  hf_cache/                                     Qwen3.8-27B-FP8 (~28 GB; one model for 02b, 02c and 04)
   logs/  debug/
 ```
 Every path can still be overridden per script (`--meta-dir`, `--processed-dir`, `--out`, ...).
@@ -112,8 +112,7 @@ processing unless you pass `--keep-tar`. Check the log for the detected parquet 
 
 ### 2a. (Recommended) LLM game identification
 ```bash
-python 02b_llm_label_games.py                       # vLLM + Qwen/Qwen2.5-14B-Instruct, one GPU
-python 02b_llm_label_games.py --model Qwen/Qwen2.5-32B-Instruct --tensor-parallel-size 2   # knows more obscure games
+python 02b_llm_label_games.py                       # vLLM + Qwen/Qwen3.8-27B-FP8 (thinking disabled), one 48 GB GPU
 ```
 For every video whose slug is `"other"` or unrecognised (including chapter names like
 `profaned_capital`), this fetches the YouTube title, channel, tags and description, reusing the cache
@@ -185,7 +184,9 @@ Outputs: `data/manifest_2d.parquet` plus `data/reports/*.csv`, `sampling_info.js
 Many videos are stream captures whose frame also holds Twitch chat, a webcam, alerts or decorative
 panels, and NitroGen has no `bbox_game_area` for them. In the first real smoke test this affected 4 of 16 clips.
 `02c_detect_layout.py` grabs 3 frames per video (all videos by default, because NitroGen's own game areas
-often still include stream bars) and asks Qwen2.5-VL for the game-screen rectangle plus overlay boxes.
+often still include stream bars) and asks the VLM (default Qwen3.8-27B FP8) three things in its native grounding format ("Locate ..., output
+bbox coordinates in JSON format"): the game screen, every livestream element (chat, webcam, status bar, border,
+...), and the frame type. At startup it checks whether the model answers boxes in 0–1000 or pixels.
 Overlays that touch an edge and span most of the frame (chat columns, status bars, bezels) are **cropped
 off**; smaller ones inside the picture (webcams) are inpainted. Stage 03 crops to metadata area ∩ 02c area.
 ```bash
@@ -269,7 +270,7 @@ python 03_download_and_process.py --status
 python 04_caption_frames.py --backend vllm                 # 4 frames per clip by default (--qc-frames)
 # multi-GPU: CUDA_VISIBLE_DEVICES=i python 04_caption_frames.py --num-shards N --shard-index i, then --merge-only
 ```
-One request per clip shows Qwen2.5-VL 4 frames (start, 1/3, 2/3, end) and returns:
+One request per clip shows the VLM (default Qwen3.8-27B FP8) 4 frames (start, 1/3, 2/3, end) and returns:
 * `caption` for frame 0 (art style, perspective, biome, main character; no HUD, text or game name);
 * `screens`: a per-frame label (gameplay, menu, title, loading, cutscene, map_or_inventory, black,
   not_a_game) -> `vlm_frac_gameplay`. In the first real smoke test, menus, title screens and an emulator

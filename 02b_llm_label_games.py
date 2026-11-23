@@ -227,7 +227,7 @@ def get_llm(args):
 class VLLMText:
     def __init__(self, args):
         from vllm import LLM, SamplingParams
-        self.llm = LLM(model=args.model, tensor_parallel_size=args.tensor_parallel_size, dtype="bfloat16",
+        self.llm = LLM(model=args.model, tensor_parallel_size=args.tensor_parallel_size,
                        max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_mem, seed=0,
                        enforce_eager=args.enforce_eager)
         self.sp = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens)
@@ -272,8 +272,8 @@ def main():
     ap.add_argument("--min-video-hours", type=float, default=0.0, help="skip videos shorter than this")
     ap.add_argument("--limit", type=int, default=0, help="label at most N videos (largest first)")
     ap.add_argument("--backend", choices=["vllm", "openai"], default="vllm")
-    ap.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct",
-                    help="any instruct LLM; bigger models know more obscure games")
+    ap.add_argument("--model", default="Qwen/Qwen3.8-27B-FP8",
+                    help="any instruct model vLLM can run; bigger/newer models know more obscure games")
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--skip-game-pass", action="store_true", help="skip the per-game perspective pass")
     ap.add_argument("--compare-with", default=None,
