@@ -44,3 +44,21 @@
 2026-11-23 01:51:05 | WARNING | 02_profile_and_sample | target 100000.0 h >= available 15.3 h; taking everything (alpha=1).
 2026-11-23 01:51:05 | INFO    | 02_profile_and_sample | split train             games=   5 videos=   15 chunks=  2,757 hours=   15.3
 2026-11-23 01:51:05 | INFO    | 02_profile_and_sample | Wrote /tmp/ng_test/man_prio.parquet (2,757 chunks, 15.3 h). Reports in /tmp/ng_test/r_prio
+2026-11-23 02:45:50 | INFO    | 02_profile_and_sample | Loading index (18 columns) ...
+2026-11-23 02:45:50 | INFO    | 02_profile_and_sample | Loaded 3,861 chunks from 16 videos
+2026-11-23 02:45:50 | INFO    | 02_profile_and_sample | fps filter [30.0, 60.0] -> 3,861 chunks
+2026-11-23 02:45:50 | INFO    | 02_profile_and_sample | Slug labels: {'3d': 3.5, 'unknown': 18.0}
+2026-11-23 02:45:50 | INFO    | 02_profile_and_sample | Game-level perspectives: 4 from llm_game_perspectives.parquet, 2 from video majority
+2026-11-23 02:45:50 | INFO    | 02_profile_and_sample | LLM labels (/tmp/ng_test/llm_game_labels.parquet): applied to 3 videos (conf>=0.60) -> {'2d': 7.0, '3d': 6.199999809265137, 'unknown': 8.199999809265137}
+2026-11-23 02:45:50 | INFO    | 02_profile_and_sample | 2D pool before activity filter: 1,268 chunks, 7.0 h
+2026-11-23 02:45:50 | INFO    | 02_profile_and_sample | Movement filter: stick-only keeps 6.4 h, stick-or-d-pad keeps 6.5 h (+0.2 h rescued)
+2026-11-23 02:45:50 | INFO    | 02_profile_and_sample | Activity filter (move>0.20 in >=15% frames AND buttons in >=8% frames): kept 64.4% (1,268 -> 817 chunks)
+2026-11-23 02:46:03 | INFO    | 02_profile_and_sample | Loading index (18 columns) ...
+2026-11-23 02:46:03 | INFO    | 02_profile_and_sample | Loaded 3,861 chunks from 16 videos
+2026-11-23 02:46:03 | INFO    | 02_profile_and_sample | fps filter [30.0, 60.0] -> 3,861 chunks
+2026-11-23 02:46:03 | INFO    | 02_profile_and_sample | Slug labels: {'3d': 3.5, 'unknown': 18.0}
+2026-11-23 02:46:03 | INFO    | 02_profile_and_sample | Game-level perspectives: 4 from llm_game_perspectives.parquet, 2 from video majority
+2026-11-23 02:46:03 | INFO    | 02_profile_and_sample | LLM labels (/tmp/ng_test/llm_game_labels.parquet): applied to 3 videos (conf>=0.60) -> {'2d': 7.0, '3d': 6.199999809265137, 'unknown': 8.199999809265137}
+2026-11-23 02:46:03 | INFO    | 02_profile_and_sample | 2D pool before activity filter: 1,268 chunks, 7.0 h
+2026-11-23 02:46:03 | INFO    | 02_profile_and_sample | Movement filter: stick-only keeps 6.4 h, stick-or-d-pad keeps 6.5 h (+0.2 h rescued)
+2026-11-23 02:46:03 | INFO    | 02_profile_and_sample | Activity filter (move>0.20 in >=15% frames AND buttons in >=8% frames): kept 64.4% (1,268 -> 817 chunks)

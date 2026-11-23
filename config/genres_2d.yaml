@@ -327,6 +327,17 @@ games_2d:
 
 # Titles that must never be included, even if YouTube tags look 2D (3D or 2.5D-camera games).
 exclude_3d:
+  - "Pokemon Scarlet"
+  - "Pokemon Violet"
+  - "Pokemon Scarlet and Violet"
+  - "Pokemon Legends: Arceus"
+  - "Pokemon Legends: Z-A"
+  - Undisputed
+  - Black Myth Wukong
+  - "Black Myth: Wukong"
+  - Assassin's Creed Valhalla
+  - "S.T.A.L.K.E.R. 2: Heart of Chernobyl"
+  - "Sekiro: Shadows Die Twice"
   - Kingdom Hearts
   - "Kingdom Hearts HD 1.5 + 2.5 ReMIX"
   - "Dark Souls: Remastered"

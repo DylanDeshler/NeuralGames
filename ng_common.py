@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -162,7 +163,8 @@ _ROMAN = {"ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7", "vi
 
 def norm_words(s: str) -> list[str]:
     """Lowercase words with roman numerals II-IX as digits ('I' and 'X' are left alone: Mega Man X != 10)."""
-    words = re.sub(r"[^a-z0-9]+", " ", (s or "").lower().replace("&", "and")).split()
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()  # Pokémon -> Pokemon
+    words = re.sub(r"[^a-z0-9]+", " ", s.lower().replace("&", "and")).split()
     single = [len(w) == 1 for w in words]
     out = []
     for i, w in enumerate(words):

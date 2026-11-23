@@ -543,6 +543,21 @@ def main():
         # apply where we have no label yet, or only weak evidence (keyword / slug vote)
         weak = (df["status"] == "unknown") | df["label_source"].isin(["youtube_keywords", "youtube_vote"])
         cand = set(df.loc[weak, "video_id"].unique()) & set(L.index)
+        # perspective per game: game-level LLM answer (02b second pass) > majority of video-level answers
+        gp_path = llm_path.with_name("llm_game_perspectives.parquet")
+        game_persp: dict[str, str] = {}
+        vl = L[~L["llm_perspective"].isin(["unknown", "mixed"])]
+        for k, sgrp in vl.groupby("llm_game_key"):
+            game_persp[k] = sgrp["llm_perspective"].mode().iat[0]
+        n_vote = len(game_persp)
+        if gp_path.exists():
+            gp = pd.read_parquet(gp_path)
+            gp = gp[gp["game_parse_ok"].astype(bool) & (gp["game_confidence"] >= args.llm_min_confidence)
+                    & ~gp["game_perspective"].isin(["unknown"])]
+            game_persp.update(dict(zip(gp["llm_game_key"], gp["game_perspective"])))
+            log.info("Game-level perspectives: %d from %s, %d from video majority", len(gp), gp_path.name, n_vote)
+        else:
+            log.info("No %s (re-run 02b for the per-game pass); using video-majority perspectives", gp_path.name)
         upd = {}
         for v in cand:
             r = L.loc[v]
@@ -555,11 +570,12 @@ def main():
                     name = lab.title_2d[key][0] if hit[0] == "2d" else lab.title_3d[key]
                     status, genre, src = lab.label_slug(name)
             if status == "unknown":
-                p_ = r["llm_perspective"]
+                p_ = game_persp.get(r["llm_game_key"], r["llm_perspective"])
                 status = "2d" if p_ in args.llm_accept_perspectives else ("unknown" if p_ in ("unknown", "mixed") else "3d")
                 genre, src = (r["llm_genre"] or ""), "llm"
             else:
                 src = f"llm+{src}"
+            key = lab.group_of.get(key, key)  # editions / series -> one game for the holdout
             upd[v] = (status, genre, src, key, name)
         if upd:
             u = pd.DataFrame.from_dict(upd, orient="index", columns=["status", "genre", "label_source", "game_key", "game_name"])

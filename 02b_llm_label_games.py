@@ -109,6 +109,58 @@ def parse(text: str) -> dict:
     return out
 
 
+GAME_USER_TMPL = """Video game: "{name}"
+Example YouTube titles of videos labeled with this game (for disambiguation only): {titles}
+
+What is this game's camera perspective during normal moment-to-moment gameplay?
+Answer with JSON only:
+{{"perspective": "<one of: {persp}>", "genre": "<one of: {genres}>", "confidence": <0.0-1.0>}}
+
+Definitions: "side-view-2d" = side-scrolling / 2D-plane gameplay, including 2.5D games rendered in 3D but played on a
+2D plane (Ori, Trine, Little Nightmares, modern Prince of Persia: The Lost Crown); "top-down-2d" = overhead 2D view
+(The Binding of Isaac, A Link to the Past, classic 2D Pokemon); "isometric" = angled overhead (Hades, Diablo);
+"3d" = free 3D camera / 3D movement (Elden Ring, Pokemon Violet, Fortnite); "mixed" only if the game genuinely switches."""
+
+
+def game_level_pass(df: pd.DataFrame, args, log, out_path: Path) -> pd.DataFrame:
+    """Ask the LLM once per identified game (by name) for its perspective/genre; cached by game key."""
+    cache = pd.read_parquet(out_path) if out_path.exists() else pd.DataFrame(columns=["llm_game_key"])
+    ok = df[df["llm_parse_ok"] & df["llm_game"].notna() & (df["llm_confidence"] >= 0.5)]
+    games = (ok.groupby("llm_game_key")
+             .agg(name=("llm_game", lambda s: s.mode().iat[0]), videos=("video_id", "size"),
+                  titles=("yt_title", lambda s: [t for t in s.dropna().head(3)]))
+             .reset_index())
+    todo = games[~games["llm_game_key"].isin(cache["llm_game_key"])]
+    log.info("Game-level perspective pass: %d games (%d cached, %d to ask)", len(games), len(games) - len(todo), len(todo))
+    if len(todo):
+        llm = get_llm(args)
+        rows = []
+        for i in tqdm(range(0, len(todo), args.batch_size), desc="game-level"):
+            b = todo.iloc[i:i + args.batch_size]
+            convs = [[{"role": "system", "content": SYSTEM},
+                      {"role": "user", "content": GAME_USER_TMPL.format(
+                          name=r.name, titles=" | ".join(f'"{t[:80]}"' for t in r.titles) or "(none)",
+                          persp=", ".join(PERSPECTIVES), genres=", ".join(GENRES))}] for r in b.itertuples()]
+            for r, text in zip(b.itertuples(), llm(convs)):
+                p = parse(text)  # reuses the video parser: perspective / genre / confidence fields
+                rows.append({"llm_game_key": r.llm_game_key, "game_name": r.name, "game_perspective": p["llm_perspective"],
+                             "game_genre": p["llm_genre"], "game_confidence": p["llm_confidence"],
+                             "game_parse_ok": p["llm_parse_ok"], "llm_model": args.model})
+        cache = pd.concat([cache, pd.DataFrame(rows)], ignore_index=True).drop_duplicates("llm_game_key", keep="last")
+        atomic_write_parquet(cache, out_path)
+    return cache
+
+
+_LLM = None
+
+
+def get_llm(args):
+    global _LLM
+    if _LLM is None:
+        _LLM = (VLLMText if args.backend == "vllm" else OpenAIText)(args)
+    return _LLM
+
+
 # ============================================================================ backends
 class VLLMText:
     def __init__(self, args):
@@ -161,6 +213,7 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct",
                     help="any instruct LLM; bigger models know more obscure games")
     ap.add_argument("--batch-size", type=int, default=512)
+    ap.add_argument("--skip-game-pass", action="store_true", help="skip the per-game perspective pass")
     ap.add_argument("--max-new-tokens", type=int, default=160)
     ap.add_argument("--max-model-len", type=int, default=2048, help="prompts are ~700 tokens")
     ap.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True,
@@ -225,7 +278,7 @@ def main():
                  sum(meta.get(v, {}).get("status") not in ("ok", "unavailable") for v in todo.index))
 
         # ---- LLM
-        backend = (VLLMText if args.backend == "vllm" else OpenAIText)(args)
+        backend = get_llm(args)
         with open(cache_path, "a") as fh:
             for i in tqdm(range(0, len(ok), args.batch_size), desc="llm batches"):
                 batch = ok[i:i + args.batch_size]
@@ -250,17 +303,27 @@ def main():
         log.warning("No labels produced.")
         return
     atomic_write_parquet(df, out_path)
+    if not args.skip_game_pass:
+        gp = game_level_pass(df, args, log, out_path.with_name("llm_game_perspectives.parquet"))
+        df = df.merge(gp[["llm_game_key", "game_perspective", "game_confidence"]], on="llm_game_key", how="left")
+        df["final_perspective"] = df["game_perspective"].where(
+            df["game_perspective"].notna() & (df["game_confidence"].fillna(0) >= 0.6) &
+            ~df["game_perspective"].isin(["unknown"]), df["llm_perspective"])
+    else:
+        df["final_perspective"] = df["llm_perspective"]
     df = df.merge(idx.groupby("video_id")["duration"].sum().div(3600).rename("hours"), left_on="video_id",
                   right_index=True, how="left")
     print("\n" + "=" * 78)
     print(f" LLM game labels: {len(df):,} videos, {df.hours.sum():,.0f} h -> {out_path}")
     print(f" identified (conf>=0.6, single game): "
           f"{((df.llm_confidence >= 0.6) & ~df.llm_multiple_games & df.llm_game.notna()).mean():.1%} of videos")
-    print(" hours by perspective: " + str(df.groupby("llm_perspective")["hours"].sum().round(0).to_dict()))
+    print(" hours by perspective (video-level): " + str(df.groupby("llm_perspective")["hours"].sum().round(0).to_dict()))
+    print(" hours by perspective (game-level where confident): "
+          + str(df.groupby("final_perspective")["hours"].sum().round(0).to_dict()))
     print(f" unparsable outputs: {(~df.llm_parse_ok).sum()}")
     top = (df[df.llm_game.notna()].groupby("llm_game_key")
            .agg(game=("llm_game", "first"), videos=("video_id", "size"), hours=("hours", "sum"),
-                persp=("llm_perspective", lambda s: s.mode().iat[0]))
+                persp=("final_perspective", lambda s: s.mode().iat[0]))
            .sort_values("hours", ascending=False).head(25))
     print(f" {'game':<45} {'videos':>6} {'hours':>8}  perspective")
     for _, r in top.iterrows():
