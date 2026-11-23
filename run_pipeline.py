@@ -73,6 +73,32 @@ def layout_args(a) -> list[str]:
     return ["--model", a.layout_model] if a.layout_model else []
 
 
+def proxy_ok(proxy: str | None, timeout: float = 15) -> bool:
+    """Can we reach YouTube through the proxy? (no proxy configured = nothing to check)"""
+    if not proxy:
+        return True
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    try:
+        with opener.open("https://www.youtube.com/robots.txt", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def require_proxy(a, log, wait: bool) -> None:
+    if a.dry_run or proxy_ok(a.proxy):
+        return
+    msg = (f"Proxy {a.proxy} is not reachable. On the Mac: keep `proxy --hostname 127.0.0.1 --port 8899` and the "
+           f"`ssh -N -R 8899:127.0.0.1:8899 ...` tunnel running (and the Mac awake: caffeinate -dimsu).")
+    if not wait:
+        raise StepFailed(msg)
+    log.error("%s Waiting for it to come back (checking every 30 s)...", msg)
+    while not proxy_ok(a.proxy):
+        time.sleep(30)
+    log.info("Proxy is back.")
+
+
 def count_clips(processed: Path) -> int:
     return sum(1 for _ in processed.glob("*/*/meta.json")) if processed.exists() else 0
 
@@ -97,6 +123,7 @@ def smoke(a, log):
         debug.mkdir(parents=True, exist_ok=True)
     failed = None
     try:
+        require_proxy(a, log, wait=False)
         if not a.skip_layout:  # 02c results are shared with bulk (same videos, same answers)
             run([PY, "02c_detect_layout.py", "--manifest", str(man), "--limit", str(max(40, 2 * a.clips)),
                  "--workers", str(a.workers), *layout_args(a), *net_args(a)], log, a.dry_run)
@@ -104,6 +131,8 @@ def smoke(a, log):
              "--tmp-dir", str(tmp), "--limit", str(a.clips), "--workers", str(a.workers),
              "--require-layout-check", "--min-video-gameplay-frac", str(a.min_video_gameplay_frac), *net_args(a)],
             log, a.dry_run)
+        if not a.dry_run and count_clips(processed) == 0:
+            raise StepFailed("stage 03 produced no clips (see logs/03_download_and_process.log; proxy / YouTube access?)")
         run([PY, "04_caption_frames.py", "--manifest", str(man), "--processed-dir", str(processed)], log, a.dry_run)
         run([PY, "05_pack_webdataset.py", "--manifest", str(man), "--processed-dir", str(processed),
              "--out", str(wds), "--overwrite"], log, a.dry_run)
@@ -154,15 +183,24 @@ def bulk(a, log):
     if a.resample:
         resample(a, log)
     if not a.skip_layout:
+        require_proxy(a, log, wait=True)
         run([PY, "02c_detect_layout.py", "--workers", str(a.workers), *layout_args(a), *net_args(a)], log, a.dry_run)
     cycle = 0
     while True:
         cycle += 1
         log.info("════════ cycle %d ════════", cycle)
         before = count_clips(processed)
-        run([PY, "03_download_and_process.py", "--limit", str(a.cycle_clips), "--workers", str(a.workers),
-             "--min-free-gb", str(a.min_free_gb), "--require-layout-check",
-             "--min-video-gameplay-frac", str(a.min_video_gameplay_frac), *net_args(a)], log, a.dry_run)
+        require_proxy(a, log, wait=True)
+        proxy_dropped = False
+        try:
+            run([PY, "03_download_and_process.py", "--limit", str(a.cycle_clips), "--workers", str(a.workers),
+                 "--min-free-gb", str(a.min_free_gb), "--require-layout-check",
+                 "--min-video-gameplay-frac", str(a.min_video_gameplay_frac), *net_args(a)], log, a.dry_run)
+        except StepFailed as e:
+            if "exit 3" not in str(e):
+                raise
+            log.warning("stage 03 stopped because the proxy went down; packing what we have, then waiting")
+            proxy_dropped = True
         new = count_clips(processed) - before
         log.info("cycle %d: %d new clips processed", cycle, new)
         if count_clips(processed) or a.dry_run:
@@ -171,7 +209,7 @@ def bulk(a, log):
         run([PY, "03_download_and_process.py", "--status"], log, a.dry_run)
         if a.dry_run or (a.max_cycles and cycle >= a.max_cycles):
             break
-        if new == 0:
+        if new == 0 and not proxy_dropped:
             log.info("No new clips this cycle: either everything is done, the disk floor (--min-free-gb %s) is "
                      "reached even after packing, or downloads are blocked (see 03's log). Stopping.", a.min_free_gb)
             break

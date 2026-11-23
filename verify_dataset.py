@@ -201,6 +201,7 @@ def main():
         shards = sorted((root / split).rglob("*.tar"))
         if not shards:
             print(f"[{split}] no shards found")
+            total_fail += 1
             continue
         idx = json.loads((root / split / "index.json").read_text()) if (root / split / "index.json").exists() else {}
         print(f"\n[{split}] {len(shards)} shards, index: samples={idx.get('samples')} hours={idx.get('hours')} "

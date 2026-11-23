@@ -56,6 +56,7 @@ PERMANENT_ERR = re.compile(
     r"(private video|video unavailable|video is unavailable|does not exist|has been removed|no longer available|account associated|"
     r"copyright|members-only|join this channel|confirm your age|is not available|terminated|"
     r"This live event|premieres in)", re.I)
+PROXY_ERR = re.compile(r"(Unable to connect to proxy|ProxyError|proxy.*(refused|unreachable)|Connection refused.*8899)", re.I)
 RATE_ERR = re.compile(r"(HTTP Error 429|too many requests|not a bot|sign in to confirm|rate.?limit)", re.I)
 
 
@@ -106,6 +107,7 @@ class StreamResolver:
         self.glock = threading.Lock()
         self.dead: dict[str, str] = {}
         self.bot_streak = 0  # consecutive bot-check / 429 failures across all workers
+        self.proxy_streak = 0  # consecutive "cannot connect to proxy" failures
 
     def ydl_opts(self, fmt: str) -> dict:
         o = {"quiet": True, "no_warnings": True, "noplaylist": True, "format": fmt, "socket_timeout": 30,
@@ -506,6 +508,9 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
                 if RATE_ERR.search(str(e)):
                     limiter.penalize(args.rate_penalty)
                     resolver.bot_streak += 1
+                if PROXY_ERR.search(str(e)):
+                    resolver.proxy_streak += 1
+                    raise  # no point trying other methods or retrying: the proxy itself is down
                 log.debug("%s via %s failed: %s", row.uuid, method, e)
         if method_used is None:
             raise last_err or RuntimeError("no method succeeded")
@@ -538,6 +543,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
         os.replace(work / "meta.json", out_dir / "meta.json")
         src_actions.unlink(missing_ok=True)
         resolver.bot_streak = 0
+        resolver.proxy_streak = 0
         return {"status": "ok", "method": method_used, "padded": n_out - decoded, "bucket": geo["bucket"]}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -633,8 +639,8 @@ def apply_layout_overrides(man: pd.DataFrame, args, log) -> pd.DataFrame:
         return json.dumps(cur + extra)
     man.loc[with_ov, "bbox_others"] = [merge_others(o, v) for o, v in zip(man.loc[with_ov, "bbox_others"], vid[with_ov])]
     keep = pd.Series(True, index=man.index)
-    if args.require_layout_check:
-        keep &= has_ga | vid.isin(ok.index)
+    if args.require_layout_check:  # 02c now checks every video (it also refines metadata boxes)
+        keep &= vid.isin(lo.set_index("video_id").index)
     if args.min_video_gameplay_frac > 0:
         keep &= ~vid.map(ok["frac_gameplay"]).fillna(1.0).lt(args.min_video_gameplay_frac)
     log.info("Layout overrides: game area filled for %s chunks (%d videos), overlays added for %s chunks; "
@@ -801,6 +807,8 @@ def main():
                 record_failure(row, "permanent", e)
                 return {"status": "permanent"}
             except Exception as e:
+                if PROXY_ERR.search(str(e)):
+                    return {"status": "transient"}  # proxy down: don't burn retries, main loop stops
                 if attempt == args.retries - 1:
                     record_failure(row, "transient", e)
                     log.warning("%s failed after %d attempts: %s", row.uuid, args.retries, str(e)[:300])
@@ -809,11 +817,17 @@ def main():
                 time.sleep(5 * 2 ** attempt)
 
     rows = list(todo.itertuples(index=False))
+    proxy_down = False
     pbar = tqdm(total=len(rows), desc="clips", unit="clip")
     with ThreadPoolExecutor(args.workers) as ex:
         pending, it = set(), iter(rows)
         stop = False
         while True:
+            if not stop and resolver.proxy_streak >= 3:
+                log.error("Cannot connect to the proxy %s (%d failures in a row). Is the SSH tunnel / proxy running? "
+                          "Stopping; nothing was marked failed, re-run when it's back.", args.proxy, resolver.proxy_streak)
+                stop = True
+                proxy_down = True
             if not stop and resolver.bot_streak >= args.max_bot_streak:
                 log.error("YouTube is bot-blocking this IP (%d consecutive bot-check/429 failures). Stopping; progress "
                           "is saved. Use --cookies (logged-in, ideally with a PO-token provider plugin) or --proxy, "
@@ -845,6 +859,8 @@ def main():
     pbar.close()
     log.info("Done: %s | buckets: %s", stats, dict(sorted(buckets.items(), key=lambda kv: -kv[1])))
     print_status(man, args)
+    if proxy_down:
+        raise SystemExit(3)  # distinct exit code: run_pipeline waits for the proxy and retries
 
 
 if __name__ == "__main__":
