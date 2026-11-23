@@ -26,6 +26,7 @@ import base64
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -38,8 +39,8 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from ng_common import (DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, setup_logging, strip_thinking, vllm_chat_kwargs,
-                       vllm_mm_kwargs)
+from ng_common import (DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, openai_chat_many, setup_logging, strip_thinking,
+                       vllm_chat_kwargs, vllm_mm_kwargs)
 
 _spec = importlib.util.spec_from_file_location("stage03", Path(__file__).with_name("03_download_and_process.py"))
 S3 = importlib.util.module_from_spec(_spec)
@@ -182,21 +183,46 @@ def parse(text: str, w: int, h: int) -> dict | None:
             "stream": bool(d.get("is_stream_layout", False))}
 
 
-def calibrate_coords(llm, sp, chat_kw, log) -> bool:
+class LocalVLM:
+    """vLLM in-process (loads the model; ~minutes)."""
+    def __init__(self, args):
+        from vllm import LLM, SamplingParams
+        self.llm = LLM(model=args.model, max_model_len=8192, limit_mm_per_prompt={"image": 1},
+                       gpu_memory_utilization=args.gpu_mem, enforce_eager=args.enforce_eager, seed=0,
+                       **vllm_mm_kwargs(args.model, 640 * 28 * 28))
+        self.sp = SamplingParams(temperature=0.0, max_tokens=400)
+        self.kw = vllm_chat_kwargs(args.model)
+
+    def chat(self, convs):
+        return [o.outputs[0].text for o in self.llm.chat(convs, self.sp, use_tqdm=False, **self.kw)] if convs else []
+
+
+class ServerVLM:
+    """A running OpenAI-compatible server (`vllm serve <model>`): no model load, shareable with stage 04."""
+    def __init__(self, args):
+        from openai import OpenAI
+        self.client = OpenAI(base_url=args.api_base, api_key=args.api_key or os.environ.get("OPENAI_API_KEY", "EMPTY"))
+        self.model, self.conc = args.model, args.concurrency
+
+    def chat(self, convs):
+        return openai_chat_many(self.client, self.model, convs, 400, self.conc) if convs else []
+
+
+def calibrate_coords(vlm, log) -> bool:
     """Ask the model for the box of a white rectangle at a known spot in a 576x320 image and decide whether it
     answers in 0-1000 normalized coordinates (as instructed) or in pixels. Returns NORMALIZED."""
     w, h = 576, 320
     img = Image.new("RGB", (w, h), (0, 0, 0))
     img.paste((255, 255, 255), (288, 40, 560, 280))  # normalized ~ [500, 125, 972, 875]; pixels = [288, 40, 560, 280]
     q = 'Locate the white rectangle in this image, output its bbox coordinates in JSON format.'
-    out = llm.chat([[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": to_data_uri(img)}},
-                                                  {"type": "text", "text": q}]}]], sp, use_tqdm=False, **chat_kw)
-    items = _grounding_items(out[0].outputs[0].text) or []
+    out = vlm.chat([[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": to_data_uri(img)}},
+                                                  {"type": "text", "text": q}]}]])
+    items = _grounding_items(out[0]) or []
     b = items[0]["box"] if items else None
     try:
         x1, y1, x2, y2 = (float(v) for v in b)
     except (TypeError, ValueError):
-        log.warning("Coordinate calibration unparsable (%r); assuming 0-1000 normalized", out[0].outputs[0].text[:120])
+        log.warning("Coordinate calibration unparsable (%r); assuming 0-1000 normalized", out[0][:120])
         return True
     err_norm = abs(x1 - 500) + abs(y1 - 125) + abs(x2 - 972) + abs(y2 - 875)
     err_px = abs(x1 - 288) + abs(y1 - 40) + abs(x2 - 560) + abs(y2 - 280)
@@ -379,6 +405,11 @@ def main():
     ap.add_argument("--model", default=DEFAULT_VLM,
                     help="any vLLM-supported image model (default Qwen3.8-27B FP8, fits a 48 GB GPU)")
     ap.add_argument("--gpu-mem", type=float, default=0.85)
+    ap.add_argument("--backend", choices=["vllm", "openai"], default="vllm",
+                    help="'openai' = use a running `vllm serve` / OpenAI-compatible server (no model load per run)")
+    ap.add_argument("--api-base", default="http://localhost:8000/v1")
+    ap.add_argument("--api-key", default=None)
+    ap.add_argument("--concurrency", type=int, default=32, help="parallel requests to the server")
     ap.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     # network (same semantics as stage 03)
     ap.add_argument("--proxy", default=None)
@@ -414,14 +445,9 @@ def main():
     if not todo:
         return
 
-    from vllm import LLM, SamplingParams
-    llm = LLM(model=args.model, max_model_len=8192, limit_mm_per_prompt={"image": 1},
-              gpu_memory_utilization=args.gpu_mem, enforce_eager=args.enforce_eager, seed=0,
-              **vllm_mm_kwargs(args.model, 640 * 28 * 28))
-    sp = SamplingParams(temperature=0.0, max_tokens=400)
-    chat_kw = vllm_chat_kwargs(args.model)
+    vlm = ServerVLM(args) if args.backend == "openai" else LocalVLM(args)
     global NORMALIZED
-    NORMALIZED = calibrate_coords(llm, sp, chat_kw, log)
+    NORMALIZED = calibrate_coords(vlm, log)
     resolver, limiter = S3.StreamResolver(args, log), S3.RateLimiter(args.max_starts_per_min)
     global BUCKETS
     BUCKETS = S3.auto_buckets(S3.CANONICAL_BUCKETS, 0.05)  # only for the predicted-bucket report; 03 decides
@@ -468,10 +494,9 @@ def main():
                         {"type": "image_url", "image_url": {"url": uri}},
                         {"type": "text", "text": prompt}]}])
                     owners.append((v, fi, kind, w, h))
-        outs = llm.chat(convs, sp, use_tqdm=False, **chat_kw) if convs else []
+        outs = vlm.chat(convs)
         answers: dict[tuple[str, int], dict] = {}
-        for (v, fi, kind, w, h), o in zip(owners, outs):
-            txt = o.outputs[0].text
+        for (v, fi, kind, w, h), txt in zip(owners, outs):
             answers.setdefault((v, fi), {})[kind] = (parse_game(txt, w, h) if kind == "game" else
                                                      parse_layout(txt, w, h) if kind == "layout" else parse_screen(txt))
         per_vid: dict[str, list[dict]] = {}

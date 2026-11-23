@@ -31,8 +31,6 @@ import io
 import json
 import os
 import re
-import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -40,8 +38,8 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from ng_common import (DATA_ROOT, DEFAULT_VLM, atomic_write_json, atomic_write_parquet, processed_dir_for, setup_logging,
-                       strip_thinking, vllm_chat_kwargs, vllm_mm_kwargs)
+from ng_common import (DATA_ROOT, DEFAULT_VLM, atomic_write_json, atomic_write_parquet, openai_chat_many,
+                       processed_dir_for, setup_logging, strip_thinking, vllm_chat_kwargs, vllm_mm_kwargs)
 
 DEFAULT_MODEL = DEFAULT_VLM
 SCREENS = ["gameplay", "menu", "title", "loading", "cutscene", "map_or_inventory", "black", "not_a_game"]
@@ -187,23 +185,11 @@ class OpenAIBackend:
         self.client = OpenAI(base_url=args.api_base, api_key=args.api_key or os.environ.get("OPENAI_API_KEY", "EMPTY"))
         self.model, self.max_new, self.conc = args.model, args.max_new_tokens, args.concurrency
 
-    def _one(self, ims):
-        for attempt in range(5):
-            try:
-                r = self.client.chat.completions.create(
-                    model=self.model, temperature=0.0, max_tokens=self.max_new,
-                    messages=[{"role": "user", "content": [
-                        *({"type": "image_url", "image_url": {"url": to_data_uri(im)}} for im in ims),
-                        {"type": "text", "text": prompt_for(len(ims))}]}])
-                return r.choices[0].message.content
-            except Exception:
-                if attempt == 4:
-                    raise
-                time.sleep(2 ** attempt)
-
     def __call__(self, batch):
-        with ThreadPoolExecutor(self.conc) as ex:
-            return list(ex.map(self._one, batch))
+        convs = [[{"role": "user", "content": [
+            *({"type": "image_url", "image_url": {"url": to_data_uri(im)}} for im in ims),
+            {"type": "text", "text": prompt_for(len(ims))}]}] for ims in batch]
+        return openai_chat_many(self.client, self.model, convs, self.max_new, self.conc)
 
 
 # ============================================================================ manifest merge

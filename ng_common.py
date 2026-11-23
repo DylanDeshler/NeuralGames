@@ -267,3 +267,24 @@ def vllm_mm_kwargs(model: str, max_pixels: int) -> dict:
 
 def strip_thinking(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+
+
+def openai_chat_many(client, model: str, convs: list[list[dict]], max_tokens: int, concurrency: int = 32) -> list[str]:
+    """Send many chat requests to an OpenAI-compatible server (e.g. `vllm serve`) concurrently; returns texts.
+    Thinking is disabled for Qwen3.x via chat_template_kwargs (vLLM honours it in extra_body)."""
+    import time as _t
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    extra = vllm_chat_kwargs(model) or None
+
+    def one(msgs):
+        for attempt in range(5):
+            try:
+                r = client.chat.completions.create(model=model, messages=msgs, temperature=0.0, max_tokens=max_tokens,
+                                                   extra_body=extra)
+                return r.choices[0].message.content or ""
+            except Exception:
+                if attempt == 4:
+                    return ""
+                _t.sleep(2 ** attempt)
+    with _TPE(concurrency) as ex:
+        return list(ex.map(one, convs))

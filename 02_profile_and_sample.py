@@ -627,6 +627,24 @@ def main():
     elif llm_path:
         log.info("No LLM labels at %s (run 02b_llm_label_games.py to add them)", llm_path)
 
+    # safety net: final label vs a confident per-video LLM label (catches e.g. a whole channel mislabeled by tags)
+    if llm_path and llm_path.exists():
+        Lr = pd.read_parquet(llm_path).drop_duplicates("video_id", keep="last").set_index("video_id")
+        Lr = Lr[Lr["llm_parse_ok"] & Lr["llm_game"].notna() & (Lr["llm_confidence"] >= 0.8) & ~Lr["llm_multiple_games"].astype(bool)]
+        pv = df[df["status"] == "2d"].groupby("video_id").agg(game_key=("game_key", "first"), game=("game_name", "first"),
+                                                              src=("label_source", "first"), hours=("duration", "sum"))
+        pv = pv[pv.index.isin(Lr.index)]
+        pv["llm_game"] = Lr.loc[pv.index, "llm_game"]
+        pv["llm_key"] = [lab.group_of.get(lab.canonical_key(g), lab.canonical_key(g)) for g in pv["llm_game"]]
+        dis = pv[pv["llm_key"] != pv["game_key"]].copy()
+        dis["hours"] /= 3600
+        dis.sort_values("hours", ascending=False).to_csv(reports / "label_llm_disagreements.csv")
+        if len(dis):
+            top = dis.groupby(["game", "src"])["hours"].agg(["sum", "size"]).sort_values("sum", ascending=False).head(8)
+            log.warning("2D videos whose label disagrees with a confident LLM label: %d videos, %.0f h "
+                        "(reports/label_llm_disagreements.csv). Largest:\n%s", len(dis), dis["hours"].sum(),
+                        top.round(1).to_string())
+
     # label report for manual curation
     rep = df.groupby(["game_name", "status", "label_source"]).agg(
         videos=("video_id", "nunique"), hours=("duration", "sum")).reset_index()
