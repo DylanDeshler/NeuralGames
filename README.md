@@ -247,25 +247,34 @@ python 03_download_and_process.py --status
   An HTTP proxy works for both yt-dlp and ffmpeg's stream fetch. Stream URLs are tied to the IP that
   resolved them, so both must go through the same proxy. Throughput is bounded by the home connection.
 
-### 4. Caption frame 0
+### 4. VLM pass per clip: caption, gameplay QC, title check
 ```bash
-python 04_caption_frames.py --backend vllm --batch-size 64                    # one GPU
-# multi-GPU data parallel:
-for i in 0 1 2 3; do CUDA_VISIBLE_DEVICES=$i python 04_caption_frames.py --num-shards 4 --shard-index $i & done; wait
-python 04_caption_frames.py --merge-only
-# or against a server:  vllm serve Qwen/Qwen2.5-VL-7B-Instruct
-python 04_caption_frames.py --backend openai --api-base http://localhost:8000/v1 --concurrency 32
+python 04_caption_frames.py --backend vllm                 # 4 frames per clip by default (--qc-frames)
+# multi-GPU: CUDA_VISIBLE_DEVICES=i python 04_caption_frames.py --num-shards N --shard-index i, then --merge-only
 ```
-The letterbox is cropped off and the frame upscaled to 448 px before captioning. The VLM returns JSON
-`{caption, perspective, is_2d}`, and the prompt explicitly forbids mentioning HUD elements, health
-bars, score counters, text, overlays and the game's name. Results go into each `meta.json` and into
-the manifest columns `caption`, `vlm_perspective`, `vlm_is_2d` and `frame0_dark`.
+One request per clip shows Qwen2.5-VL 4 frames (start, 1/3, 2/3, end) and returns:
+* `caption` for frame 0 (art style, perspective, biome, main character; no HUD, text or game name);
+* `screens`: a per-frame label (gameplay, menu, title, loading, cutscene, map_or_inventory, black,
+  not_a_game) -> `vlm_frac_gameplay`. In the first real smoke test, menus, title screens and an emulator
+  ROM browser all passed the idle filter because menu navigation produces inputs.
+* `game_title` it recognizes, used only for the train/val leakage check below.
+
+Results go into `meta.json` and the manifest (`caption`, `vlm_frac_gameplay`, `vlm_game_title`, ...). The
+pass is resumable. Throughput is roughly 10–20 clips/s on one 48 GB GPU with vLLM (~900 tokens per clip),
+and it can run while stage 03 is still downloading.
 
 ### 5. Pack + verify
 ```bash
 python 05_pack_webdataset.py --drop-vlm-3d          # ~1 GB shards in data/webdataset/{train,val_unseen_games}
 python verify_dataset.py --num-shards 3 --debug-videos 2
 ```
+Stage 05 also drops clips with `vlm_frac_gameplay < --min-gameplay-frac` (0.75), clips with more than
+25 % near-black frames (`--max-black-frac`) and, with `--val-leak-check` (default), **val_unseen_games
+videos whose frames the VLM recognizes as a different game that's in train**. Some labels are wrong
+(e.g. a "Street Fighters 2" video that's actually *Sunset Riders*), and this stops them leaking a training
+game into the unseen-game split. All label/frames disagreements are listed in
+`webdataset/name_mismatch_report.csv` for review; fix recurring ones in `config/game_labels.csv`.
+
 Shards are written per bucket (`train/21x12/train-21x12-000000.tar`, ...), and `index.json` lists
 each bucket's resolution, samples and hours. To train, sample a bucket in proportion to its hours,
 then stream same-shape batches from its shards. Each sample has `<uuid>.mp4`, `.actions.npy`

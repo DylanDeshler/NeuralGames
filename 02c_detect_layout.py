@@ -29,7 +29,8 @@ import json
 import re
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -103,40 +104,52 @@ def parse(text: str, w: int, h: int) -> dict | None:
 
 
 # ============================================================================ frame grabbing
-def grab_frames(vid: str, url: str, times: list[float], tmp: Path, args, resolver, limiter) -> list[Image.Image]:
-    """Single frames at `times` via the direct stream URL (falls back to yt-dlp sections)."""
-    frames = []
-    fmt = S3.format_selector(15.0, 720)
+def grab_frames(vid: str, url: str, times: list[float], tmp: Path, args, resolver, limiter) -> tuple[list[Image.Image], str]:
+    """Single frames at `times`. Direct stream URL with hard network timeouts; if that fails, yt-dlp
+    section downloads (tried once per video, not per frame). Returns (frames, method)."""
+    frames: list[Image.Image] = []
+    fmt = S3.format_selector(15.0, args.max_src_height)
     info = None
     try:
-        info = resolver.resolve(vid, url, fmt, 720, limiter)
+        info = resolver.resolve(vid, url, fmt, args.max_src_height, limiter)
     except S3.PermanentError:
         raise
     except Exception:
         info = None
+    method = "direct"
+    use_direct = bool(info and info.get("url"))
     for i, t in enumerate(times):
         out = tmp / f"f{i}.png"
         ok = False
-        if info and info.get("url"):
+        if use_direct:
             hdr = "".join(f"{k}: {v}\r\n" for k, v in (info.get("headers") or {}).items())
             cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                   "-rw_timeout", str(int(args.net_timeout * 1e6)),
                    *(["-headers", hdr] if hdr else []),
                    *(["-http_proxy", args.proxy] if args.proxy and args.proxy.startswith("http") else []),
                    "-ss", f"{t:.2f}", "-i", info["url"], "-frames:v", "1", str(out)]
-            ok = subprocess.run(cmd, capture_output=True, timeout=120).returncode == 0 and out.exists()
-        if not ok:  # fallback: 1.5 s section via yt-dlp, then first frame
+            try:
+                ok = subprocess.run(cmd, capture_output=True, timeout=args.net_timeout * 2).returncode == 0 and out.exists()
+            except subprocess.TimeoutExpired:
+                ok = False
+            if not ok:
+                use_direct = False  # don't keep hammering a URL that failed; switch this video to sections
+        if not ok:
+            method = "sections"
             try:
                 raw = S3.download_section(url, fmt, t, t + 1.5, tmp, args)
                 ok = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(raw),
-                                     "-frames:v", "1", str(out)], capture_output=True).returncode == 0
+                                     "-frames:v", "1", str(out)], capture_output=True, timeout=30).returncode == 0
                 raw.unlink(missing_ok=True)
             except S3.PermanentError:
                 raise
             except Exception:
                 ok = False
+            if not ok:
+                break  # both paths failed for this video: give up on it instead of retrying every frame
         if ok and out.exists():
             frames.append(Image.open(out).convert("RGB"))
-    return frames
+    return frames, method
 
 
 def aggregate(results: list[dict], full_thresh: float) -> dict:
@@ -190,10 +203,12 @@ def main():
     ap.add_argument("--proxy", default=None)
     ap.add_argument("--cookies", default=None)
     ap.add_argument("--cookies-from-browser", default=None)
-    ap.add_argument("--max-starts-per-min", type=float, default=30.0)
+    ap.add_argument("--max-starts-per-min", type=float, default=60.0, help="URL resolutions per minute (1 per video)")
     ap.add_argument("--rate-penalty", type=float, default=120.0)
     ap.add_argument("--url-ttl", type=float, default=3 * 3600)
-    ap.add_argument("--download-timeout", type=float, default=120)
+    ap.add_argument("--download-timeout", type=float, default=60)
+    ap.add_argument("--net-timeout", type=float, default=20, help="seconds without network progress before a fetch fails")
+    ap.add_argument("--max-src-height", type=int, default=480, help="probe-frame resolution (layout needs little detail)")
     args = ap.parse_args()
 
     log = setup_logging("02c_detect_layout")
@@ -205,6 +220,9 @@ def main():
     order = vids.groupby("video_id")["download_priority"].min().sort_values().index.tolist()
     out_path = Path(args.out)
     done = pd.read_parquet(out_path) if out_path.exists() else pd.DataFrame(columns=["video_id"])
+    if len(done):  # retry transient failures; keep successes and permanent failures
+        final = done["status"].isin(["ok", "unparsed"]) | done["status"].astype(str).str.startswith("permanent")
+        done = done[final]
     todo = [v for v in order if v not in set(done["video_id"])]
     if args.limit:
         todo = todo[: args.limit]
@@ -228,12 +246,14 @@ def main():
         url = g.url.iloc[0] if isinstance(g.url.iloc[0], str) else f"https://www.youtube.com/watch?v={v}"
         tmp = Path(args.tmp_dir) / v
         tmp.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
         try:
-            return v, grab_frames(v, url, times, tmp, args, resolver, limiter), None
+            frames, method = grab_frames(v, url, times, tmp, args, resolver, limiter)
+            return v, frames, None, method, time.time() - t0
         except S3.PermanentError as e:
-            return v, [], f"permanent: {str(e)[:100]}"
+            return v, [], f"permanent: {str(e)[:100]}", "-", time.time() - t0
         except Exception as e:
-            return v, [], f"error: {str(e)[:100]}"
+            return v, [], f"error: {str(e)[:100]}", "-", time.time() - t0
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -244,33 +264,55 @@ def main():
             atomic_write_parquet(done, out_path)
             rows.clear()
 
-    with ThreadPoolExecutor(args.workers) as ex:
-        for i in tqdm(range(0, len(todo), args.batch_size), desc="video batches"):
-            batch = todo[i:i + args.batch_size]
-            got = list(ex.map(fetch, batch))
-            convs, owners = [], []
-            for v, frames, err in got:
-                if not frames:
-                    rows.append({"video_id": v, "status": err or "no_frames"})
-                    continue
-                for f in frames:
-                    w, h = fit28(*f.size)
-                    convs.append([{"role": "user", "content": [
-                        {"type": "image_url", "image_url": {"url": to_data_uri(f.resize((w, h), Image.Resampling.BICUBIC))}},
-                        {"type": "text", "text": PROMPT.format(w=w, h=h)}]}])
-                    owners.append((v, w, h))
-            outs = llm.chat(convs, sp, use_tqdm=False) if convs else []
-            per_vid: dict[str, list[dict]] = {}
-            for (v, w, h), o in zip(owners, outs):
-                r = parse(o.outputs[0].text, w, h)
-                if r:
-                    per_vid.setdefault(v, []).append(r)
-            for v, frames, err in got:
-                if not frames:
-                    continue
+    def run_vlm(got):
+        convs, owners = [], []
+        for v, frames, err, _, _ in got:
+            if not frames:
+                rows.append({"video_id": v, "status": err or "no_frames"})
+                continue
+            for f in frames:
+                w, h = fit28(*f.size)
+                convs.append([{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": to_data_uri(f.resize((w, h), Image.Resampling.BICUBIC))}},
+                    {"type": "text", "text": PROMPT.replace("{w}", str(w)).replace("{h}", str(h))}]}])
+                owners.append((v, w, h))
+        outs = llm.chat(convs, sp, use_tqdm=False) if convs else []
+        per_vid: dict[str, list[dict]] = {}
+        for (v, w, h), o in zip(owners, outs):
+            r = parse(o.outputs[0].text, w, h)
+            if r:
+                per_vid.setdefault(v, []).append(r)
+        for v, frames, err, method, secs in got:
+            if frames:
                 res = per_vid.get(v, [])
-                rows.append({"video_id": v, "status": "ok" if res else "unparsed", **(aggregate(res, args.full_thresh) if res else {})})
-            flush()
+                rows.append({"video_id": v, "status": "ok" if res else "unparsed", "fetch_method": method,
+                             "fetch_s": round(secs, 1), **(aggregate(res, args.full_thresh) if res else {})})
+        flush()
+
+    stats = {"ok": 0, "fail": 0, "direct": 0, "sections": 0, "secs": 0.0}
+    ready = []
+    pbar = tqdm(total=len(todo), desc="videos", unit="vid")
+    with ThreadPoolExecutor(args.workers) as ex:
+        futs = [ex.submit(fetch, v) for v in todo]
+        for f in as_completed(futs):
+            r = f.result()
+            ready.append(r)
+            stats["ok" if r[1] else "fail"] += 1
+            if r[3] in ("direct", "sections"):
+                stats[r[3]] += 1
+            stats["secs"] += r[4]
+            n = stats["ok"] + stats["fail"]
+            pbar.update(1)
+            pbar.set_postfix(ok=stats["ok"], fail=stats["fail"], direct=stats["direct"], sections=stats["sections"],
+                             s_per_vid=f"{stats['secs'] / n:.0f}")
+            if n <= 3 or (r[2] and stats["fail"] <= 5):
+                log.info("%s: %d frames via %s in %.0fs %s", r[0], len(r[1]), r[3], r[4], r[2] or "")
+            if len(ready) >= args.batch_size:
+                run_vlm(ready)
+                ready = []
+    if ready:
+        run_vlm(ready)
+    pbar.close()
     flush()
     ok = done[done["status"] == "ok"]
     log.info("Done: %d videos ok | cropped (stream layout / sub-area): %d | with in-game overlays: %d | "

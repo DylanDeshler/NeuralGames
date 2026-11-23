@@ -34,12 +34,38 @@ import pandas as pd
 from tqdm import tqdm
 
 from ng_common import DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, processed_dir_for, setup_logging
+from ng_labels import GameLabeler
 
 
 def decode_mp4(path: Path) -> np.ndarray:
     import av
     with av.open(str(path)) as c:
         return np.stack([f.to_ndarray(format="rgb24") for f in c.decode(video=0)])
+
+
+def name_check(man: pd.DataFrame, args, out: Path, log) -> set[str]:
+    """Compare each video's label with the game stage 04's VLM recognizes in its frames (majority over the
+    video's clips). Writes name_mismatch_report.csv; returns val videos that look like a TRAIN game."""
+    if not args.val_leak_check or "vlm_game_title" not in man.columns or man["vlm_game_title"].notna().sum() == 0:
+        log.info("Name check skipped (no vlm_game_title in the manifest; run stage 04 first)")
+        return set()
+    lab = GameLabeler(Path(args.genres), Path(args.labels_csv) if args.labels_csv else None)
+    t = man[man["vlm_game_title"].notna()]
+    title = t.groupby("video_id")["vlm_game_title"].agg(lambda s: s.mode().iat[0])
+    support = t.groupby("video_id")["vlm_game_title"].agg(lambda s: float((s == s.mode().iat[0]).mean()))
+    key = title.map(lambda x: lab.group_of.get(lab.canonical_key(x), lab.canonical_key(x)))
+    per_vid = man.drop_duplicates("video_id").set_index("video_id")[["game_key", "game_name", "split"]]
+    rep = per_vid.join(pd.DataFrame({"vlm_title": title, "vlm_key": key, "vlm_support": support}), how="inner")
+    rep = rep[rep["vlm_key"] != rep["game_key"]]
+    train_keys = set(man.loc[man["split"] == "train", "game_key"])
+    rep["vlm_key_in_train"] = rep["vlm_key"].isin(train_keys)
+    hours = man.groupby("video_id")["duration"].sum() / 3600
+    rep["hours"] = hours.reindex(rep.index).round(2)
+    rep.sort_values("hours", ascending=False).to_csv(out / "name_mismatch_report.csv")
+    leak = set(rep.index[(rep["split"] == "val_unseen_games") & rep["vlm_key_in_train"]])
+    log.info("Name check: %d of %d checked videos disagree with their label (%.0f h, see name_mismatch_report.csv); "
+             "%d val videos look like a train game -> dropped from val", len(rep), len(title), rep["hours"].sum(), len(leak))
+    return leak
 
 
 def main():
@@ -55,6 +81,13 @@ def main():
     ap.add_argument("--allow-missing-caption", action="store_true")
     ap.add_argument("--drop-vlm-3d", action="store_true", help="drop chunks the VLM judged not 2D")
     ap.add_argument("--drop-dark-frame0", action="store_true")
+    ap.add_argument("--min-gameplay-frac", type=float, default=0.75,
+                    help="drop clips where stage 04's VLM saw gameplay in fewer than this fraction of sampled frames "
+                         "(menus, title/option screens, loading, emulator UIs). 0 disables")
+    ap.add_argument("--val-leak-check", action=argparse.BooleanOptionalAction, default=True,
+                    help="drop val_unseen_games videos whose frames the VLM recognizes as a different game that is in train")
+    ap.add_argument("--genres", default="./config/genres_2d.yaml")
+    ap.add_argument("--labels-csv", default="./config/game_labels.csv")
     ap.add_argument("--max-black-frac", type=float, default=0.25,
                     help="drop clips where more than this fraction of frames is near-black (fades, loading)")
     ap.add_argument("--seed", type=int, default=0)
@@ -78,6 +111,8 @@ def main():
         game_ids.setdefault(k, len(game_ids))
     atomic_write_json(gid_path, game_ids)
 
+    leak_videos = name_check(man, args, out, log)
+
     for split in args.splits:
         sdir = out / split
         if (sdir / "index.json").exists() and not args.overwrite:
@@ -88,7 +123,8 @@ def main():
         sm = man[man.split == split]
         # shuffle so each shard mixes games (important for streaming training)
         sm = sm.sample(frac=1.0, random_state=args.seed)
-        drops = {"not_processed": 0, "no_caption": 0, "vlm_3d": 0, "dark": 0, "black_frames": 0, "bad_shape": 0}
+        drops = {"not_processed": 0, "no_caption": 0, "vlm_3d": 0, "dark": 0, "black_frames": 0,
+                 "non_gameplay": 0, "val_leak": 0, "bad_shape": 0}
         stats: dict[str, dict] = {}   # bucket -> {samples, frames, hours, width, height}
         writers: dict[str, "wds.ShardWriter"] = {}
         pending_del: dict[str, list[Path]] = {}  # bucket -> clip dirs whose shard is still open
@@ -117,6 +153,13 @@ def main():
                     continue
                 if args.drop_dark_frame0 and meta.get("frame0_dark"):
                     drops["dark"] += 1
+                    continue
+                fg = meta.get("vlm_frac_gameplay")
+                if args.min_gameplay_frac > 0 and fg is not None and fg < args.min_gameplay_frac:
+                    drops["non_gameplay"] += 1
+                    continue
+                if split == "val_unseen_games" and row.video_id in leak_videos:
+                    drops["val_leak"] += 1
                     continue
                 if meta.get("frac_black", 0.0) > args.max_black_frac:
                     drops["black_frames"] += 1
