@@ -399,6 +399,7 @@ def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], f
     dec_cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *input_args, "-an", "-sn",
                "-vf", f"fps={fps_out:.6f},crop={cw}:{ch}:{x0}:{y0},scale={aw}:{ah}:flags=area,format=rgb24",
                "-frames:v", str(n_out), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    t_dec0 = time.time()
     with open(tmp / "dec.log", "wb") as dec_err:
         dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=dec_err)
         fbytes, frames = aw * ah * 3, []
@@ -413,6 +414,8 @@ def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], f
             dec.kill()
             dec.wait()
     decoded = len(frames)
+    t_fetch = time.time() - t_dec0  # network download + decode of the clip window
+    t_proc0 = time.time()
     if decoded == 0 or n_out - decoded > args.max_pad_frames:
         raise ShortClipError(f"only {decoded}/{n_out} frames decoded: {(tmp / 'dec.log').read_text()[-400:]}")
     frames += [frames[-1]] * (n_out - decoded)  # tiny tail deficit (rounding at clip end): repeat last frame
@@ -456,6 +459,7 @@ def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], f
     if enc.returncode != 0:
         raise RuntimeError(f"encoder failed: {(tmp / 'enc.log').read_text()[-500:]}")
     geo["frac_black"] = float(np.mean([f.mean() < 8 for f in frames]))  # fades / loading / signal loss
+    geo["timing"] = {"fetch_decode_s": round(t_fetch, 2), "process_encode_s": round(time.time() - t_proc0, 2)}
     geo.update(crop_src=list(crop_src), src_wh=[src_w, src_h], analysis_wh=[aw, ah], borders=list(borders),
                inpaint_boxes=boxes, inpaint_frac=float((mask > 0).sum()) / max(1, W * H))
     return decoded, geo
@@ -518,6 +522,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
     tmp = Path(args.tmp_dir) / row.uuid
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
+    t_resolve, t_chunk0 = 0.0, time.time()
     work = tmp / "out"
     work.mkdir()
     method_used, info, decoded, geo = None, {}, 0, None
@@ -528,7 +533,9 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
             try:
                 fmt = format_selector(fps_out, cap)  # only need >= output fps (e.g. 30), not the 60 fps annotation
                 if method == "direct":
+                    t_res0 = time.time()
                     info = resolver.resolve(row.video_id, url, fmt, cap, limiter)
+                    t_resolve = time.time() - t_res0
                     if not info.get("width") or not info.get("height"):
                         raise RuntimeError("stream dims unknown")
                     src_wh = (info["width"], info["height"])
@@ -599,6 +606,8 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
             "analysis_wh": geo["analysis_wh"], "border_crop_ltrb": geo["borders"],
             "inpaint_boxes": geo["inpaint_boxes"], "inpaint_frac": geo["inpaint_frac"], "decoded_frames": int(decoded),
             "frac_black": geo["frac_black"], "layout_override": bool(getattr(row, "layout_override", False)),
+            "timing": {**geo.get("timing", {}), "resolve_s": round(t_resolve, 2),
+                       "total_s": round(time.time() - t_chunk0, 2)},
             "padded_frames": int(n_out - decoded), "method": method_used, "format_id": info.get("format_id"),
             "vcodec": args.vcodec, "enc_args": args.enc_args, "original_metadata": orig,
             "processed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -747,6 +756,13 @@ def print_status(man: pd.DataFrame, args) -> None:
         cap = man.loc[done, "download_priority"].max() if "download_priority" in man.columns else float("nan")
         print(f"  downloaded subset: {len(h)} games, eff_games {np.exp(-(p * np.log(p)).sum()):.1f}, "
               f"top game {p.max():.1%}, per-game cap reached ≈ {cap:.1f} h")
+    metas = sorted(Path(args.processed_dir).glob("*/*/meta.json"), key=lambda p: p.stat().st_mtime)[-300:]
+    tims = [json.loads(p.read_text()).get("timing") for p in metas]
+    tims = [t for t in tims if t]
+    if tims:
+        med = {k: float(np.median([t.get(k, 0) for t in tims])) for k in ("resolve_s", "fetch_decode_s", "process_encode_s", "total_s")}
+        print(f"  per-clip median over last {len(tims)} clips: resolve {med['resolve_s']:.1f}s | download+decode "
+              f"{med['fetch_decode_s']:.1f}s | process+encode {med['process_encode_s']:.1f}s | total {med['total_s']:.1f}s")
     print(f"  disk used: {shutil.disk_usage(args.processed_dir).used / 1e9:.0f} GB (volume), "
           f"free {free_gb(args.processed_dir):.0f} GB")
 

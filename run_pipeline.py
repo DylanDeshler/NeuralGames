@@ -146,6 +146,17 @@ def proxy_ok(proxy: str | None, timeout: float = 15) -> bool:
         return False
 
 
+def require_js_runtime(a, log) -> None:
+    """Without a JS runtime yt-dlp can't solve YouTube's challenge and gets real-time-throttled stream URLs
+    (a 20 s clip takes ~20 s to fetch). Refuse to start downloading in that state."""
+    if a.dry_run or a.allow_no_js:
+        return
+    if shutil.which("deno") is None:
+        raise StepFailed("deno (JavaScript runtime for yt-dlp) not found on PATH: YouTube downloads would be throttled "
+                         "to real time. Install: curl -fsSL https://deno.land/install.sh | sh ; export "
+                         "PATH=$HOME/.deno/bin:$PATH ; pip install -U 'yt-dlp[default]'  (or pass --allow-no-js)")
+
+
 def require_proxy(a, log, wait: bool) -> None:
     if a.dry_run or proxy_ok(a.proxy):
         return
@@ -185,6 +196,7 @@ def smoke(a, log):
         debug.mkdir(parents=True, exist_ok=True)
     failed = None
     try:
+        require_js_runtime(a, log)
         require_proxy(a, log, wait=False)
         if a.start_vlm_server:
             start_vlm_server(a, log)
@@ -246,6 +258,7 @@ def bulk(a, log):
     processed = DATA_ROOT / "processed"
     if a.resample:
         resample(a, log)
+    require_js_runtime(a, log)
     if a.start_vlm_server:
         start_vlm_server(a, log)
     bg02c = None
@@ -326,6 +339,7 @@ def main():
     ap.add_argument("--resample", action="store_true", help="re-run stage 02 first")
     ap.add_argument("--resume", action="store_true", help="smoke: keep already-processed smoke clips instead of starting over")
     ap.add_argument("--dry-run", action="store_true", help="print the commands without running them")
+    ap.add_argument("--allow-no-js", action="store_true", help="run even without deno (downloads will be throttled)")
     ap.add_argument("--push-to-hub", default=None, metavar="REPO_ID",
                     help="bulk: after each cycle verify + upload new shards to this PRIVATE HF dataset repo and delete "
                          "them locally (disk then only holds one cycle)")
