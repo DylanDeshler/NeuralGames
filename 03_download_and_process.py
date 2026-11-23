@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import re
+import logging
 import shutil
 import subprocess
 import threading
@@ -380,6 +381,20 @@ def warp(frame: np.ndarray, borders, geo) -> np.ndarray:
 
 
 # ============================================================================ core processing
+_HWACCEL = {"on": False}  # set in main(); switched off for good after a failed GPU decode
+
+
+def hwaccel_available() -> bool:
+    """ffmpeg built with CUDA hwaccel and an NVIDIA GPU visible."""
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-hwaccels"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "cuda" in out.split()
+
+
 def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], fps_out: float, n_out: int,
                           out_mp4: Path, frame0_png: Path, args, tmp: Path, lock: dict | None = None) -> tuple[int, dict]:
     """ffmpeg decode (crop game area, analysis-res) -> buffer -> detect bars -> choose bucket ->
@@ -396,23 +411,40 @@ def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], f
         crop_src = source_crop(row, src_w, src_h)
     x0, y0, cw, ch = crop_src
     aw, ah = analysis_dims(cw, ch, args.analysis_max_dim)
-    dec_cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *input_args, "-an", "-sn",
-               "-vf", f"fps={fps_out:.6f},crop={cw}:{ch}:{x0}:{y0},scale={aw}:{ah}:flags=area,format=rgb24",
-               "-frames:v", str(n_out), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    def run_decoder(hw: bool) -> list[np.ndarray]:
+        # NVDEC decodes on the GPU (frames come back to RAM for the cheap fps/crop/scale filters); the 4-core
+        # box is CPU-bound on 720p60 software decoding otherwise
+        dec_cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *(["-hwaccel", "cuda"] if hw else []),
+                   *input_args, "-an", "-sn",
+                   "-vf", f"fps={fps_out:.6f},crop={cw}:{ch}:{x0}:{y0},scale={aw}:{ah}:flags=area,format=rgb24",
+                   "-frames:v", str(n_out), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+        with open(tmp / "dec.log", "wb") as dec_err:
+            dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=dec_err)
+            fbytes, out = aw * ah * 3, []
+            try:
+                while len(out) < n_out:
+                    buf = dec.stdout.read(fbytes)
+                    if len(buf) < fbytes:
+                        break
+                    out.append(np.frombuffer(buf, np.uint8).reshape(ah, aw, 3))
+            finally:
+                dec.stdout.close()
+                dec.kill()
+                dec.wait()
+        return out
+
     t_dec0 = time.time()
-    with open(tmp / "dec.log", "wb") as dec_err:
-        dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=dec_err)
-        fbytes, frames = aw * ah * 3, []
-        try:
-            while len(frames) < n_out:
-                buf = dec.stdout.read(fbytes)
-                if len(buf) < fbytes:
-                    break
-                frames.append(np.frombuffer(buf, np.uint8).reshape(ah, aw, 3))
-        finally:
-            dec.stdout.close()
-            dec.kill()
-            dec.wait()
+    hw = _HWACCEL["on"]
+    frames = run_decoder(hw)
+    if hw and not frames:  # GPU decode failed (unsupported codec, out of NVDEC sessions...): retry on CPU
+        err = (tmp / "dec.log").read_text(errors="replace")[-300:]
+        hw_err = any(k in err.lower() for k in ("cuda", "nvdec", "cuvid", "hardware", "device", "hwaccel"))
+        if hw_err and _HWACCEL["on"]:  # a GPU problem (not a network error): CPU for the rest of the run
+            _HWACCEL["on"] = False
+            logging.getLogger("03_download_and_process").warning(
+                "GPU decoding failed, switching to CPU decoding: %s", err.strip().replace("\n", " | "))
+        hw = False
+        frames = run_decoder(False)
     decoded = len(frames)
     t_fetch = time.time() - t_dec0  # network download + decode of the clip window
     t_proc0 = time.time()
@@ -459,7 +491,8 @@ def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], f
     if enc.returncode != 0:
         raise RuntimeError(f"encoder failed: {(tmp / 'enc.log').read_text()[-500:]}")
     geo["frac_black"] = float(np.mean([f.mean() < 8 for f in frames]))  # fades / loading / signal loss
-    geo["timing"] = {"fetch_decode_s": round(t_fetch, 2), "process_encode_s": round(time.time() - t_proc0, 2)}
+    geo["timing"] = {"fetch_decode_s": round(t_fetch, 2), "process_encode_s": round(time.time() - t_proc0, 2),
+                     "gpu_decode": hw}
     geo.update(crop_src=list(crop_src), src_wh=[src_w, src_h], analysis_wh=[aw, ah], borders=list(borders),
                inpaint_boxes=boxes, inpaint_frac=float((mask > 0).sum()) / max(1, W * H))
     return decoded, geo
@@ -766,7 +799,8 @@ def print_status(man: pd.DataFrame, args) -> None:
     if tims:
         med = {k: float(np.median([t.get(k, 0) for t in tims])) for k in ("resolve_s", "fetch_decode_s", "process_encode_s", "total_s")}
         print(f"  per-clip median over last {len(tims)} clips: resolve {med['resolve_s']:.1f}s | download+decode "
-              f"{med['fetch_decode_s']:.1f}s | process+encode {med['process_encode_s']:.1f}s | total {med['total_s']:.1f}s")
+              f"{med['fetch_decode_s']:.1f}s | process+encode {med['process_encode_s']:.1f}s | total {med['total_s']:.1f}s"
+              f" | GPU-decoded {np.mean([bool(t.get('gpu_decode')) for t in tims]):.0%}")
     print(f"  disk used: {shutil.disk_usage(args.processed_dir).used / 1e9:.0f} GB (volume), "
           f"free {free_gb(args.processed_dir):.0f} GB")
 
@@ -817,6 +851,9 @@ def main():
     ap.add_argument("--mask-dilate", type=int, default=2, help="mask dilation in output pixels")
     ap.add_argument("--inpaint-radius", type=float, default=3.0)
     ap.add_argument("--max-pad-frames", type=int, default=6, help="max tail frames to pad by repetition")
+    ap.add_argument("--hwaccel", choices=["auto", "cuda", "none"], default="auto",
+                    help="decode on the GPU with NVDEC (auto = if ffmpeg has CUDA and nvidia-smi exists); falls back "
+                         "to CPU after a failure")
     ap.add_argument("--vcodec", default="libx264", help="libx264 | h264_nvenc | libx265 ...")
     ap.add_argument("--enc-args", default="-preset medium -crf 18 -pix_fmt yuv444p",
                     help="encoder args; lossless: '-preset veryslow -crf 0 -pix_fmt yuv444p'; "
@@ -854,6 +891,8 @@ def main():
     for tool in ("ffmpeg", "ffprobe", "yt-dlp"):
         if shutil.which(tool) is None:
             raise SystemExit(f"'{tool}' not found on PATH")
+    _HWACCEL["on"] = args.hwaccel == "cuda" or (args.hwaccel == "auto" and hwaccel_available())
+    log.info("Decoding on %s", "GPU (NVDEC, -hwaccel cuda)" if _HWACCEL["on"] else "CPU")
     man = pd.read_parquet(args.manifest)
     man = apply_layout_overrides(man, args, log)
     if args.split != "all":
