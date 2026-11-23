@@ -761,7 +761,11 @@ def main():
     ap.add_argument("--split", choices=["train", "val_unseen_games", "all"], default="all")
     ap.add_argument("--limit", type=int, default=0, help="process at most N chunks (testing)")
     ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--max-starts-per-min", type=float, default=30.0, help="rate limit for YouTube requests")
+    ap.add_argument("--max-starts-per-min", type=float, default=60.0,
+                    help="max yt-dlp URL resolves per minute (one per video while cached; ffmpeg range fetches are not limited)")
+    ap.add_argument("--video-group-window", type=int, default=20000,
+                    help="within each window of N clips (priority order), process a video's chunks back to back so one "
+                         "URL resolve serves them all (0 = strict priority order)")
     ap.add_argument("--rate-penalty", type=float, default=120.0, help="global pause (s) after a 429/bot check")
     ap.add_argument("--retries", type=int, default=3)
     ap.add_argument("--retry-failed", action="store_true", help="retry chunks marked permanently failed")
@@ -858,6 +862,16 @@ def main():
         todo = todo[ok_fps]
     if args.limit:
         todo = todo.head(args.limit)
+    if args.video_group_window > 0 and len(todo):
+        # Balanced-first order puts a different video on almost every clip, so every clip paid a fresh yt-dlp
+        # URL resolve (rate-limited, seconds each). Within each window of the priority order, process a video's
+        # chunks back to back: one resolve serves all of them; balance across windows is unchanged.
+        todo = todo.reset_index(drop=True)
+        todo["_win"] = np.arange(len(todo)) // args.video_group_window
+        todo = todo.sort_values(["_win", "video_id", "chunk_id"]).drop(columns="_win").reset_index(drop=True)
+        log.info("Grouped by video within windows of %d: %s clips from %s videos (%.1f clips per URL resolve)",
+                 args.video_group_window, f"{len(todo):,}", f"{todo.video_id.nunique():,}",
+                 len(todo) / max(1, todo.video_id.nunique()))
     log.info("Manifest %s chunks | already done %s | to process %s", f"{len(man):,}", f"{done_mask.sum():,}",
              f"{len(todo):,}")
     if todo.empty:
