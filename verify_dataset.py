@@ -164,7 +164,7 @@ def make_debug_video(it: dict, path: Path) -> None:
     import av
     fps = float(it["meta"].get("fps", 30))
     with av.open(str(path), "w") as c:
-        st = c.add_stream("libx264", rate=round(fps))
+        st = c.add_stream("libx264", rate=round(fps), options={"crf": "12", "preset": "medium"})
         boxes = it["meta"].get("inpaint_boxes")
         f0 = draw_overlay(it["frames"][0], it["acts"][0], boxes=boxes)
         st.width, st.height, st.pix_fmt = f0.shape[1], f0.shape[0], "yuv420p"

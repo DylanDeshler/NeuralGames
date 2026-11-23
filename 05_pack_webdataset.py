@@ -158,19 +158,27 @@ def main():
                     continue
                 fg, scr = meta.get("vlm_frac_gameplay"), meta.get("vlm_screens") or []
                 if args.min_gameplay_frac > 0 and "caption" in meta and fg is None and not args.allow_missing_caption:
-                    drops["qc_unparsed"] += 1  # stage 04 ran but its QC output didn't parse: don't let it pass silently
+                    drops["qc_unparsed"] += 1
+                    if args.delete_processed:
+                        shutil.rmtree(d, ignore_errors=True)  # dropped for quality: free the disk too  # stage 04 ran but its QC output didn't parse: don't let it pass silently
                     continue
                 if args.min_gameplay_frac > 0 and fg is not None and fg < args.min_gameplay_frac:
                     drops["non_gameplay"] += 1
+                    if args.delete_processed:
+                        shutil.rmtree(d, ignore_errors=True)  # dropped for quality: free the disk too
                     continue
                 if args.require_frame0_gameplay and scr and scr[0] != "gameplay":
-                    drops["frame0_not_gameplay"] += 1  # frame 0 is the caption/conditioning frame
+                    drops["frame0_not_gameplay"] += 1
+                    if args.delete_processed:
+                        shutil.rmtree(d, ignore_errors=True)  # dropped for quality: free the disk too  # frame 0 is the caption/conditioning frame
                     continue
                 if split == "val_unseen_games" and row.video_id in leak_videos:
                     drops["val_leak"] += 1
                     continue
                 if meta.get("frac_black", 0.0) > args.max_black_frac:
                     drops["black_frames"] += 1
+                    if args.delete_processed:
+                        shutil.rmtree(d, ignore_errors=True)  # dropped for quality: free the disk too
                     continue
                 acts = np.load(d / "actions.npy")
                 if acts.ndim != 2 or acts.shape[1] != ACTION_DIM or acts.shape[0] != meta["n_frames"]:

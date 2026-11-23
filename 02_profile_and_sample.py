@@ -305,7 +305,14 @@ def download_priority(sel: pd.DataFrame, rng: np.random.Generator) -> pd.Series:
         per_vid = []
         for _, v in g.groupby("video_id"):
             idx = v.sort_values("chunk_id").index.to_numpy()
-            per_vid.append(list(idx[_spread_order(len(idx))]))
+            n = len(idx)
+            # start mid-video and spread outwards; the first/last ~5% of a stream (setup, menus, title
+            # screens, outros) goes to the very end of the queue
+            order = [(i + n // 2) % n for i in _spread_order(n)]
+            edge = max(1, int(round(0.05 * n))) if n >= 6 else 0
+            is_edge = [o < edge or o >= n - edge for o in order]
+            order = [o for o, e in zip(order, is_edge) if not e] + [o for o, e in zip(order, is_edge) if e]
+            per_vid.append(list(idx[order]))
         rng.shuffle(per_vid)
         per_vid.sort(key=len, reverse=True)
         order = [lst[i] for i in range(max(map(len, per_vid))) for lst in per_vid if i < len(lst)]

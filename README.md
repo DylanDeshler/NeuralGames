@@ -170,9 +170,10 @@ Outputs: `data/manifest_2d.parquet` plus `data/reports/*.csv`, `sampling_info.js
 ### 2c. Stream-layout detection (before downloading clips)
 Many videos are stream captures whose frame also holds Twitch chat, a webcam, alerts or decorative
 panels, and NitroGen has no `bbox_game_area` for them. In the first real smoke test this affected 4 of 16 clips.
-`02c_detect_layout.py` grabs 3 frames per such video and asks Qwen2.5-VL for the game-screen rectangle
-plus any webcam/chat boxes on top of it. The median across frames is written to
-`layout_overrides.parquet`; stage 03 uses it as the crop and inpaints the overlay boxes.
+`02c_detect_layout.py` grabs 3 frames per video (all videos by default, because NitroGen's own game areas
+often still include stream bars) and asks Qwen2.5-VL for the game-screen rectangle plus overlay boxes.
+Overlays that touch an edge and span most of the frame (chat columns, status bars, bezels) are **cropped
+off**; smaller ones inside the picture (webcams) are inpainted. Stage 03 crops to metadata area ∩ 02c area.
 ```bash
 python 02c_detect_layout.py --proxy http://127.0.0.1:8899 --limit 50   # check the summary line, then run without --limit
 python 03_download_and_process.py --proxy http://127.0.0.1:8899 --require-layout-check ...
@@ -220,9 +221,11 @@ python 03_download_and_process.py --status
   (41.6 dB PSNR vs CRF 10, measured), at ~2.5× less disk. Use `--enc-args "-preset medium -crf 22 -pix_fmt yuv444p"`
   to save another ~35 %, `-crf 0` for lossless, or `--vcodec h264_nvenc --enc-args "-preset p7 -tune hq -rc constqp -qp 10 -pix_fmt yuv444p"`
   to encode on the GPU.
-* Source resolution defaults to **480p30** (`--max-src-height 480`): ≥1.5× the output bucket, and about a
-  third of the bytes of 720p60. It's raised automatically, up to 1080p, when `bbox_game_area` is a small part
-  of the frame. Format selection only requires ≥ the output fps, not the 60 fps annotation rate.
+* Source format: the selector prefers **~480p**, otherwise the next tier up to `--max-src-height` (720 by
+  default), and only falls back to lower resolutions if nothing else exists. YouTube's 360p is only
+  ~0.4–0.5 Mbit/s and visibly smears pixel art, and many videos have 360p and 720p60 but no 480p. Source
+  download is ~0.5 GB/h at 480p and ~1 GB/h at 720p60, through the proxy if you use one. `--max-src-height 480`
+  falls back to 360p when there's no 480p, which saves bandwidth at a clear cost in quality.
 * `--target-fps 15` (default; the training rate) picks an integer stride per chunk (60→15 uses 4,
   30→15 uses 2). Actions are pooled over each window: sticks are averaged, buttons are OR'd, so a 1-frame
   tap at 60 fps survives. The keyframe interval defaults to 2 s at the output fps. Stage 02's default

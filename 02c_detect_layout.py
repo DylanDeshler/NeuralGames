@@ -176,6 +176,27 @@ def aggregate(results: list[dict], full_thresh: float) -> dict:
             clusters.append([o])
     need = int(np.ceil(len(results) / 2))
     keep = [np.median(np.array(cl), axis=0).tolist() for cl in clusters if len(cl) >= need]
+    # Panels the VLM reports as "overlays" that touch an edge of the game box and span most of it (chat
+    # columns, status bars, decorative bezels) are layout, not in-game overlays: crop them off instead of
+    # inpainting a huge region. Remaining overlays (webcams etc. inside the picture) stay for inpainting.
+    g = g.copy()
+    inner = []
+    for o in keep:
+        h_span = (min(o[3], g[3]) - max(o[1], g[1])) / max(g[3] - g[1], 1e-6)
+        w_span = (min(o[2], g[2]) - max(o[0], g[0])) / max(g[2] - g[0], 1e-6)
+        if o[0] <= g[0] + 0.03 and h_span >= 0.6 and o[2] < g[0] + 0.5 * (g[2] - g[0]):
+            g[0] = max(g[0], o[2])
+        elif o[2] >= g[2] - 0.03 and h_span >= 0.6 and o[0] > g[0] + 0.5 * (g[2] - g[0]):
+            g[2] = min(g[2], o[0])
+        elif o[1] <= g[1] + 0.03 and w_span >= 0.6 and o[3] < g[1] + 0.5 * (g[3] - g[1]):
+            g[1] = max(g[1], o[3])
+        elif o[3] >= g[3] - 0.03 and w_span >= 0.6 and o[1] > g[1] + 0.5 * (g[3] - g[1]):
+            g[3] = min(g[3], o[1])
+        else:
+            inner.append(o)
+    keep = inner
+    area = (g[2] - g[0]) * (g[3] - g[1])
+    full = (g[0] <= 1 - full_thresh and g[1] <= 1 - full_thresh and g[2] >= full_thresh and g[3] >= full_thresh)
     screens = [r["screen"] for r in results]
     return {"game_area": None if full else json.dumps({"xtl": g[0], "ytl": g[1], "xbr": g[2], "ybr": g[3]}),
             "game_area_frac": float(area), "box_spread": spread, "overlays": json.dumps(keep),
@@ -189,8 +210,9 @@ def main():
     ap.add_argument("--manifest", default=str(DATA_ROOT / "manifest_2d.parquet"))
     ap.add_argument("--out", default=str(DATA_ROOT / "layout_overrides.parquet"))
     ap.add_argument("--tmp-dir", default=str(DATA_ROOT / "tmp_02c"))
-    ap.add_argument("--scope", choices=["missing", "all"], default="missing",
-                    help="'missing' = only videos without bbox_game_area in the metadata")
+    ap.add_argument("--scope", choices=["missing", "all"], default="all",
+                    help="'all' (default): NitroGen's own game areas often still include stream bars, so check every "
+                         "video; 'missing' = only videos without bbox_game_area")
     ap.add_argument("--frames-per-video", type=int, default=3)
     ap.add_argument("--full-thresh", type=float, default=0.97, help="box edges beyond this => full frame, no crop")
     ap.add_argument("--limit", type=int, default=0)

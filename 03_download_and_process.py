@@ -153,10 +153,16 @@ class StreamResolver:
             self.cache.pop(k, None)
 
 
-def format_selector(fps: float, cap: int) -> str:
+def format_selector(fps: float, cap: int, prefer_min: int = 400) -> str:
+    """Smallest decent stream: prefer ~480p, else the next tier up to `cap` (often 720p: many videos have
+    no 480p and YouTube's 360p is ~0.4 Mbit/s mush), and only fall back to lower resolutions if nothing else."""
     f = max(1, int(fps) - 1)
-    return (f"bv*[height<={cap}][fps>={f}][vcodec^=avc1]/bv*[height<={cap}][fps>={f}]/"
-            f"bv*[height<={max(cap, 1080)}][fps>={f}]/bv*[height<={cap}]/b[height<={cap}]/bv*/b")
+    mid = max(prefer_min, min(cap, 540))
+    tiers = [f"[height>={prefer_min}][height<={mid}]", f"[height>{mid}][height<={cap}]", f"[height<={cap}]"]
+    sel = []
+    for t in tiers:
+        sel += [f"bv*{t}[fps>={f}][vcodec^=avc1]", f"bv*{t}[fps>={f}]"]
+    return "/".join(sel + [f"bv*[height<={cap}]", f"b[height<={cap}]", "bv*", "b"])
 
 
 def probe_dims(path: Path) -> tuple[int, int]:
@@ -590,9 +596,32 @@ def apply_layout_overrides(man: pd.DataFrame, args, log) -> pd.DataFrame:
     lo = pd.read_parquet(p)
     ok = lo[lo["status"] == "ok"].set_index("video_id")
     vid = man["video_id"]
-    fill = ~has_ga & vid.isin(ok.index) & vid.map(ok["game_area"]).notna()
-    man.loc[fill, "bbox_game_area"] = vid[fill].map(ok["game_area"])
+    # final game area = metadata area (or full frame) ∩ 02c area (or full frame); skip suspicious shrinkage
+    new_ga, changed, suspicious = [], [], 0
+    for meta_s, v in zip(man["bbox_game_area"], vid):
+        meta_ga = _jload(meta_s)
+        det = _jload(ok.at[v, "game_area"]) if v in ok.index and isinstance(ok.at[v, "game_area"], str) else None
+        if not isinstance(det, dict):
+            new_ga.append(meta_s)
+            changed.append(False)
+            continue
+        base = meta_ga if isinstance(meta_ga, dict) else {"xtl": 0.0, "ytl": 0.0, "xbr": 1.0, "ybr": 1.0}
+        inter = {"xtl": max(base["xtl"], det["xtl"]), "ytl": max(base["ytl"], det["ytl"]),
+                 "xbr": min(base["xbr"], det["xbr"]), "ybr": min(base["ybr"], det["ybr"])}
+        a_base = (base["xbr"] - base["xtl"]) * (base["ybr"] - base["ytl"])
+        a_int = max(0.0, inter["xbr"] - inter["xtl"]) * max(0.0, inter["ybr"] - inter["ytl"])
+        if a_int < 0.3 * a_base:  # boxes barely overlap: don't trust the combination
+            suspicious += 1
+            new_ga.append(meta_s)
+            changed.append(False)
+        else:
+            new_ga.append(json.dumps(inter))
+            changed.append(True)
+    man["bbox_game_area"] = new_ga
+    fill = pd.Series(changed, index=man.index)
     man["layout_override"] = fill
+    if suspicious:
+        log.warning("Layout: %d chunks where the 02c box barely overlaps the metadata box -> kept metadata", suspicious)
     with_ov = vid.isin(ok.index[ok["overlays"].fillna("[]") != "[]"])
 
     def merge_others(row_others, video):
@@ -657,9 +686,9 @@ def main():
     ap.add_argument("--retries", type=int, default=3)
     ap.add_argument("--retry-failed", action="store_true", help="retry chunks marked permanently failed")
     ap.add_argument("--method", choices=["auto", "direct", "sections"], default="auto")
-    ap.add_argument("--max-src-height", type=int, default=480,
-                    help="source resolution cap. 480p is >= 2x the default buckets and ~1/3 the bytes of 720p60; raised "
-                         "automatically (up to 1080) when bbox_game_area is a small part of the frame")
+    ap.add_argument("--max-src-height", type=int, default=720,
+                    help="source resolution cap. The selector prefers ~480p and uses up to this when no 480p exists "
+                         "(YouTube's 360p is too compressed); raised automatically (up to 1080) for small game areas")
     ap.add_argument("--patch", type=int, default=16, help="model patch size in px; buckets are in patch units")
     ap.add_argument("--buckets", default=DEFAULT_BUCKETS,
                     help="'auto' (canonical game aspects + gap fillers, ~256 tokens each) or an explicit "
