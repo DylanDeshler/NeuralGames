@@ -113,19 +113,38 @@ def parse(text: str) -> dict:
 GAME_USER_TMPL = """Video game: "{name}"
 Example YouTube titles of videos labeled with this game (for disambiguation only): {titles}
 
-What is this game's camera perspective during normal moment-to-moment gameplay?
-Answer with JSON only:
-{{"perspective": "<one of: {persp}>", "genre": "<one of: {genres}>", "confidence": <0.0-1.0>}}
+Classify this game's gameplay perspective by HOW THE PLAYER MOVES, not by the art style.
+- "side-view-2d": the player moves only left/right/up/down on a single plane seen from the side. This INCLUDES games with
+  3D-rendered, hand-painted or cel-shaded graphics, as long as movement stays on that plane (2.5D). Examples: Ori and the
+  Blind Forest, Trine, Dead Cells, Rayman Legends, Donkey Kong Country Returns, Prince of Persia: The Lost Crown.
+- "top-down-2d": overhead view, movement on the ground plane, no free camera (The Binding of Isaac, A Link to the Past,
+  Enter the Gungeon).
+- "isometric": fixed angled overhead camera (Hades, Diablo, Bastion).
+- "3d": the player moves freely in depth (into/out of the scene) with a movable or chase camera (Elden Ring, Fortnite,
+  Super Mario Odyssey, Pokemon Scarlet).
+- "mixed" only if the game genuinely switches between these; "unknown" if you don't know the game.
+Most metroidvanias, platformers, run-and-guns and beat 'em ups are side-view-2d even when their graphics are 3D.
 
-Definitions: "side-view-2d" = side-scrolling / 2D-plane gameplay, including 2.5D games rendered in 3D but played on a
-2D plane (Ori, Trine, Little Nightmares, modern Prince of Persia: The Lost Crown); "top-down-2d" = overhead 2D view
-(The Binding of Isaac, A Link to the Past, classic 2D Pokemon); "isometric" = angled overhead (Hades, Diablo);
-"3d" = free 3D camera / 3D movement (Elden Ring, Pokemon Violet, Fortnite); "mixed" only if the game genuinely switches."""
+Answer with JSON only:
+{{"perspective": "<one of: {persp}>", "genre": "<one of: {genres}>", "confidence": <0.0-1.0>}}"""
+
+GAME_PROMPT_VERSION = 2
+
+# games named in the prompt above: excluded from the LLM-vs-curated agreement metric (they'd inflate it)
+PROMPT_EXAMPLE_GAMES = {norm_title(t) for t in [
+    "Ori and the Blind Forest", "Trine", "Dead Cells", "Rayman Legends", "Donkey Kong Country Returns",
+    "Prince of Persia: The Lost Crown", "The Binding of Isaac", "The Legend of Zelda: A Link to the Past",
+    "Enter the Gungeon", "Hades", "Diablo", "Bastion", "Elden Ring", "Fortnite", "Super Mario Odyssey", "Pokemon Scarlet"]}
 
 
 def game_level_pass(df: pd.DataFrame, args, log, out_path: Path) -> pd.DataFrame:
     """Ask the LLM once per identified game (by name) for its perspective/genre; cached by game key."""
     cache = pd.read_parquet(out_path) if out_path.exists() else pd.DataFrame(columns=["llm_game_key"])
+    if len(cache) and ("prompt_version" not in cache or (cache["prompt_version"] != GAME_PROMPT_VERSION).any()
+                       or (cache["llm_model"] != args.model).any()):
+        log.info("Game-level cache is from another prompt/model -> re-asking all games (old file kept as .bak)")
+        out_path.rename(out_path.with_suffix(".parquet.bak"))
+        cache = pd.DataFrame(columns=["llm_game_key"])
     ok = df[df["llm_parse_ok"] & df["llm_game"].notna() & (df["llm_confidence"] >= 0.5)]
     games = (ok.groupby("llm_game_key")
              .agg(name=("llm_game", lambda s: s.mode().iat[0]), videos=("video_id", "size"),
@@ -146,7 +165,8 @@ def game_level_pass(df: pd.DataFrame, args, log, out_path: Path) -> pd.DataFrame
                 p = parse(text)  # reuses the video parser: perspective / genre / confidence fields
                 rows.append({"llm_game_key": r.llm_game_key, "game_name": r.name, "game_perspective": p["llm_perspective"],
                              "game_genre": p["llm_genre"], "game_confidence": p["llm_confidence"],
-                             "game_parse_ok": p["llm_parse_ok"], "llm_model": args.model})
+                             "game_parse_ok": p["llm_parse_ok"], "llm_model": args.model,
+                             "prompt_version": GAME_PROMPT_VERSION})
         cache = pd.concat([cache, pd.DataFrame(rows)], ignore_index=True).drop_duplicates("llm_game_key", keep="last")
         atomic_write_parquet(cache, out_path)
     return cache
@@ -325,6 +345,7 @@ def main():
     # trust check: LLM game-level 2D/3D call vs the curated lists, on games both cover (weighted by hours)
     g = df[df.llm_game.notna()].groupby("llm_game_key").agg(game=("llm_game", "first"), hours=("hours", "sum"),
                                                              persp=("final_perspective", lambda s: s.mode().iat[0]))
+    g = g[~g.index.isin(PROMPT_EXAMPLE_GAMES)]
     g["curated"] = g["game"].map(lambda n: lab.label_slug(n)[0])
     g = g[g["curated"].isin(["2d", "3d"]) & ~g["persp"].isin(["unknown", "mixed"])]
     if len(g):

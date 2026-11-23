@@ -517,6 +517,8 @@ def main():
                 if slug_hit_keys[slug]:  # consistent single game: use its canonical key/name
                     k = next(iter(slug_hit_keys[slug]))
                     df.loc[rest, ["game_key", "game_name"]] = [k, lab.title_2d.get(k, (k,))[0]]
+                else:  # vote-only (often a level/area name): unknown game identity -> train-only 'unk:' key
+                    df.loc[rest, ["game_key", "game_name"]] = [f"unk:{slug}", f"unk:{slug}"]
             elif (votes["3d"] + votes["kw3d"]) / n > 0.5:
                 df.loc[rest, ["status", "label_source"]] = ["3d", "youtube_vote"]
         log.info("Slug votes: %d named slugs looked multi-game (left per-video)", n_multi)

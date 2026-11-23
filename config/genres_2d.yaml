@@ -327,6 +327,10 @@ games_2d:
 
 # Titles that must never be included, even if YouTube tags look 2D (3D or 2.5D-camera games).
 exclude_3d:
+  - Splatoon 3
+  - Splatoon 2
+  - Splatoon
+  - Abzu
   - "Pokemon Scarlet"
   - "Pokemon Violet"
   - "Pokemon Scarlet and Violet"
@@ -526,3 +530,4 @@ junk_slugs:
   - "^retro$|^special_events$|^games___demos$|^games$|^misc"
   - "mic_is_on|unmuted|muted_section|matches_start|gameplay_starts|in_cio_do_jogo|início"
   - "pc_specs|tier_list|stream_time_marker"
+  - "^game_over$|^runs_begin|_runs_resume$|^restricted_|_playthrough_part|_speedrun_practice$|^primera_partida$|^explicacion"
