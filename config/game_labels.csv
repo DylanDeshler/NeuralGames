@@ -1,3 +1,178 @@
-# Manual game labels (highest precedence). game = NitroGen slug or title (matching is normalized).
-# is_2d: 1/0 (or yes/no). genre is optional. Fill from data/reports/game_label_report.csv.
+# Manual game labels (highest precedence). game = NitroGen slug, curated title or LLM game name (matching is
+# normalized). is_2d: 1/0. genre optional. Grouping of mods/editions into one game lives in genres_2d.yaml:game_groups.
+#
+# Source: manual review of llm_review_games.csv (2026-11-23): games where the 14B and 32B game-level runs
+# disagreed or were unknown. Left unlabeled when unsure (they stay unknown): Nobyon/NuboFon (multi-game Russian
+# stream series), Carry the Glass, Foxy's Challenge, Knights of the Road, Scarlet City of Devils, Robocco Wars,
+# Donjon & Cie, Golem Fist, Zombata, Amazing Wizard, NES World Play, Games Done Badly, Super Mario, Daydream,
+# Fishbone, Retro Game, Other.
+#
+# Turn-based / menu-driven 2D games (RPGs, card, rhythm, tactics) are set to 0 because they're outside the target
+# genres and mostly menus. Flip them to 1 if you want them.
 game,is_2d,genre
+# --- Celeste custom maps / mods (grouped into Celeste via game_groups) ---
+Strawberry Jam,1,Platformer
+Golden Grind,1,Platformer
+Lunaris,1,Platformer
+Solaris,1,Platformer
+4Dark,1,Platformer
+A7D,1,Platformer
+Sapphire Dash,1,Platformer
+Amoeba,1,Platformer
+Calypta,1,Platformer
+Shockbounce,1,Platformer
+Ultra Summit,1,Platformer
+Transient,1,Platformer
+3L,1,Platformer
+Zucchini,1,Platformer
+Donker19,1,Platformer
+Eevee's Buff Sides,1,Platformer
+Bingo Brawlers,1,Platformer
+Doki Doki Literature Club,1,Platformer
+# --- 2D action / platformer / metroidvania / shmup ---
+Final Mission,1,Run and Gun
+Gal Guardians Servants of the Dark,1,Platformer
+Gal Guardians Demon Purge,1,Platformer
+Beyond the Ice Palace 2,1,Platformer
+Trials of the Blood Dragon,1,Platformer
+Tails of Iron,1,Metroidvania
+YOHANE THE PARHELION -BLAZE in the DEEPBLUE-,1,Metroidvania
+TBOIR+,1,2D Action
+The Young Indiana Jones Chronicles,1,2D Action
+Nova Drift,1,Arcade
+Skullmonkeys,1,Platformer
+Vernal Edge,1,Metroidvania
+Mortal Kombat,1,2D Action
+Polyroll,1,Platformer
+A Nightmare on Elm Street,1,Platformer
+Astral Ascent,1,Platformer
+Wild Guns Reloaded,1,Run and Gun
+Lethal League Blaze,1,2D Action
+Party Hard,1,2D Action
+Semblance,1,Platformer
+Tevi,1,Metroidvania
+Cursed To Golf,1,Platformer
+Mayhem Brawler,1,Beat 'em up
+Dragon Spirit,1,Arcade
+Legendary Wings,1,Arcade
+Cat Quest,1,2D Action
+The King of Dragons,1,Beat 'em up
+SKULL: The Hero Slayer,1,2D Action
+Skull,1,2D Action
+The TakeOver,1,Beat 'em up
+The Legend of Zelda: Echoes of Wisdom,1,2D Action
+Gremlins 2: The New Batch,1,2D Action
+Raiden IV,1,Arcade
+Raiden 3,1,Arcade
+Have a Nice Death,1,2D Action
+Duke Dashington Remastered,1,Platformer
+Revita,1,Platformer
+Splodey,1,Platformer
+Rabbit and Steel,1,2D Action
+Squidlit,1,Platformer
+Squid Game: The Challenge,1,Platformer
+Mr. Driller,1,Arcade
+# --- 3D (or not real-time 2D gameplay) ---
+Crisis Core - Final Fantasy VII,0,
+Indiana Jones and the Great Circle,0,
+Cronos the New Dawn,0,
+Robocop Rogue City,0,
+Battle Axe,0,
+Cool Boarders 2,0,
+Ad Infinitum,0,
+Nightreign,0,
+MADiSON,0,
+Still Wakes the Deep,0,
+Clair Obscur,0,
+Furi,0,
+Shredders,0,
+Ys III: Wanderers from Ys,0,
+EN GARDE!,0,
+Stellar Blade,0,
+Ape Escape,0,
+Wuchang,0,
+Overcooked! 2,0,
+Top Gun,0,
+Ex-Zodiac,0,
+Donald Duck: Goin' Quackers,0,
+Blue Fire,0,
+Dragon Ball: Sparking! Zero,0,
+Cult of the Lamb,0,
+Roboquest,0,
+Guardians of Azuma,0,
+Rayman 3: Hoodlum Havoc,0,
+Lost in Random,0,
+OMNO,0,
+Metaphor ReFantazio,0,
+Mario Party Superstars,0,
+FXR,0,
+Tormented Souls,0,
+Def Jam The Takeover,0,
+Chained Together,0,
+Ys IV: Mask of the Sun,0,
+Sword Art Online: Integral Factor,0,
+Enotria: The Last Song,0,
+NARUTO X BORUTO: NINJA VOLT TURNOVER,0,
+Soul Blade,0,
+Gladius,0,
+A1 Championship high,0,
+A1 Championship,0,
+The Get Down: Ultimate Drive,0,
+Thrasher Skate & Destroy,0,
+Horizon Chase Turbo,0,
+Pipe BMX,0,
+BMX Bastards,0,
+The Mortuary Assistant,0,
+Rune Factory 4,0,
+Yono and the Celestial Elephants,0,
+Fire Giant,0,
+Tibia,0,
+Redwolf,0,
+Crystalian,0,
+Soul of Cinders,0,
+First Berserker,0,
+Lethal Company,0,
+SCOOT,0,
+Session: Urban Sketching,0,
+Don't Starve,0,
+Chants of Sennaar,0,
+Snatcher,0,
+# --- turn-based / menu / rhythm / card / tactics (outside target genres; flip to 1 if wanted) ---
+Balatro,0,
+Pokémon Gold Version,0,
+Bleach The 3rd Phantom,0,
+Dance Dance Revolution SuperNOVA 2,0,
+Dance Dance Revolution EXTREME,0,
+Dance Dance Revolution: Extra Mix,0,
+Dancing Stage: Euromix,0,
+DDRMAX2: Dance Dance Revolution 7thMIX,0,
+Dance Dance Revolution 4th Mix,0,
+Project OutFox,0,
+Project DIVA,0,
+Project Diva Future Tone Plus,0,
+Patapon,0,
+Patapon 2,0,
+Patapon 3,0,
+Born of Bread,0,
+Darkest Dungeon,0,
+In Stars and Time,0,
+ONE WAY HEROICS,0,
+Arc the Lad: Capacity,0,
+Arc the Lad: Clan of the Deimos,0,
+Arc the Lad: Climax,0,
+Arc the Lad: The Climax,0,
+Arc the Lad: The Deimos Clan,0,
+Arc the Lad: War of the Ancient,0,
+Fire Emblem: Three Houses,0,
+Graal Online,0,
+Graal Era,0,
+Gartic Phone,0,
+Magic: The Gathering Arena,0,
+Chessplosion,0,
+Democracy 3,0,
+Nobunaga's Ambition: Sphere of Influence,0,
+Oxygen Not Included,0,
+INKBOUND,0,
+Top Spin 2025,0,
+Top Spin 2K25,0,
+Gundam Arsenal Base,0,

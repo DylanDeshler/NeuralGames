@@ -509,7 +509,13 @@ ambiguous_titles: [Inside, Limbo, Braid, Grime, Gris, Islets, Unravel, Afterimag
 # Titles that count as ONE game for grouping and the unseen-game holdout (editions, DLC, series
 # with near-identical mechanics). Keys/values are titles; matching is normalized.
 game_groups:
-  "The Binding of Isaac": ["The Binding of Isaac: Rebirth", "The Binding of Isaac: Repentance"]
+  # Celeste custom maps / mods (community map packs streamed as their own "games")
+  Celeste: ["Strawberry Jam", "Golden Grind", "Lunaris", "Solaris", "4Dark", "A7D", "Sapphire Dash", "Amoeba",
+            "Calypta", "Shockbounce", "Ultra Summit", "Transient", "3L", "Zucchini", "Donker19", "Eevee's Buff Sides",
+            "Bingo Brawlers", "Doki Doki Literature Club"]
+  "Skul: The Hero Slayer": ["SKULL: The Hero Slayer", "Skull"]
+  Squidlit: ["Squid Game: The Challenge"]
+  "The Binding of Isaac": ["The Binding of Isaac: Rebirth", "The Binding of Isaac: Repentance", "TBOIR+"]
   Touhou: ["Embodiment of Scarlet Devil", "Perfect Cherry Blossom", "Imperishable Night", "Mountain of Faith",
            "Subterranean Animism", "Undefined Fantastic Object", "Ten Desires", "Double Dealing Character",
            "Legacy of Lunatic Kingdom", "Hidden Star in Four Seasons", "Wily Beast and Weakest Creature",

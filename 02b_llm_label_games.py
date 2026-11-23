@@ -142,8 +142,11 @@ def game_level_pass(df: pd.DataFrame, args, log, out_path: Path) -> pd.DataFrame
     cache = pd.read_parquet(out_path) if out_path.exists() else pd.DataFrame(columns=["llm_game_key"])
     if len(cache) and ("prompt_version" not in cache or (cache["prompt_version"] != GAME_PROMPT_VERSION).any()
                        or (cache["llm_model"] != args.model).any()):
-        log.info("Game-level cache is from another prompt/model -> re-asking all games (old file kept as .bak)")
-        out_path.rename(out_path.with_suffix(".parquet.bak"))
+        old_tag = f"v{int(cache['prompt_version'].iloc[0]) if 'prompt_version' in cache else 1}_" + \
+            re.sub(r"[^A-Za-z0-9.-]+", "-", str(cache["llm_model"].iloc[0]))
+        keep = out_path.with_name(f"llm_game_perspectives.{old_tag}.parquet")
+        log.info("Game-level cache is from another prompt/model -> re-asking all games (previous run kept as %s)", keep.name)
+        out_path.rename(keep)
         cache = pd.DataFrame(columns=["llm_game_key"])
     ok = df[df["llm_parse_ok"] & df["llm_game"].notna() & (df["llm_confidence"] >= 0.5)]
     games = (ok.groupby("llm_game_key")
@@ -180,8 +183,14 @@ def write_review_list(df: pd.DataFrame, lab, out_path: Path, args, log) -> None:
     if not cur_p.exists():
         return
     cur = pd.read_parquet(cur_p).set_index("llm_game_key")
-    prev_p = Path(args.compare_with) if args.compare_with else cur_p.with_suffix(".parquet.bak")
+    if args.compare_with:
+        prev_p = Path(args.compare_with)
+    else:  # most recent kept previous run (any other prompt/model), legacy .bak as fallback
+        olds = sorted(cur_p.parent.glob("llm_game_perspectives.v*.parquet"), key=lambda q: q.stat().st_mtime)
+        prev_p = olds[-1] if olds else cur_p.with_suffix(".parquet.bak")
     prev = pd.read_parquet(prev_p).set_index("llm_game_key") if prev_p.exists() else None
+    if prev is not None:
+        log.info("Review list compares the current game-level run with %s", prev_p.name)
     g = (df[df.llm_game.notna()].groupby("llm_game_key")
          .agg(game=("llm_game", lambda x: x.mode().iat[0]), videos=("video_id", "size"), hours=("hours", "sum"),
               sample_titles=("yt_title", lambda x: " || ".join(t[:70] for t in x.dropna().head(3)))))
