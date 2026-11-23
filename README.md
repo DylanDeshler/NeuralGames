@@ -59,7 +59,7 @@ $NG_DATA_ROOT/
   nitrogen_meta/{index,actions,_done,_tars}/   stage 01 (~60 GB; _tars is scratch, ~2 GB per worker)
   yt_meta_cache.jsonl  llm_game_labels.parquet  stage 02b / 02
   manifest_2d.parquet  reports/                 stage 02
-  processed/<video_id>/<uuid>/  tmp_03/         stage 03 (~0.3 GB per hour of data @ 30 fps)
+  processed/<video_id>/<uuid>/  tmp_03/         stage 03 (~0.10 GB per hour of data @ 15 fps, CRF 18)
   webdataset/{train,val_unseen_games}/          stage 05 (same size again; delete processed/ after verifying)
   hf_cache/                                     Qwen2.5-14B (~30 GB) + Qwen2.5-VL-7B (~16 GB)
   logs/  debug/
@@ -202,22 +202,36 @@ python 03_download_and_process.py --status
   where T is the length of the actions (tail deficits ≤6 frames are padded by repeating the last
   frame and recorded in `meta.json`).
 * Output: `data/processed/<video_id>/<uuid>/{frames.mp4, actions.npy, frame0.png, meta.json}`. The
-  video is H.264 yuv444p at CRF 10. Use `--enc-args "-preset veryslow -crf 0 -pix_fmt yuv444p"` for
-  lossless, or `--vcodec h264_nvenc --enc-args "-preset p7 -tune hq -rc constqp -qp 10 -pix_fmt yuv444p"`
+  video is H.264 yuv444p at CRF 18. That's visually near-lossless on top of an already-lossy YouTube source
+  (41.6 dB PSNR vs CRF 10, measured), at ~2.5× less disk. Use `--enc-args "-preset medium -crf 22 -pix_fmt yuv444p"`
+  to save another ~35 %, `-crf 0` for lossless, or `--vcodec h264_nvenc --enc-args "-preset p7 -tune hq -rc constqp -qp 10 -pix_fmt yuv444p"`
   to encode on the GPU.
 * Source resolution defaults to **480p30** (`--max-src-height 480`): ≥1.5× the output bucket, and about a
   third of the bytes of 720p60. It's raised automatically, up to 1080p, when `bbox_game_area` is a small part
   of the frame. Format selection only requires ≥ the output fps, not the 60 fps annotation rate.
-* `--target-fps 30` (default) picks an integer stride per chunk (60→30 uses 2, 30→30 uses 1). Actions
-  are pooled over each window: sticks are averaged, buttons are OR'd, so a 2-frame tap survives.
-  Pooling composes, so you can go 30→15 at load time with the same rule. Stage 02's default `--fps 30 60`
-  drops the ~1 % of 25/50 fps videos, which can't reach 30 with an integer stride.
+* `--target-fps 15` (default; the training rate) picks an integer stride per chunk (60→15 uses 4,
+  30→15 uses 2). Actions are pooled over each window: sticks are averaged, buttons are OR'd, so a 1-frame
+  tap at 60 fps survives. The keyframe interval defaults to 2 s at the output fps. Stage 02's default
+  `--fps 30 60` drops the ~1 % of 25/50 fps videos, which can't reach 15 with an integer stride. The
+  chunk fps (n_frames/duration) is snapped to the nominal rate, and clip timing uses the metadata `start_time`.
 * Private/removed videos are recorded as permanent failures in `data/processed/_failed.jsonl` and
   skipped on re-runs. HTTP 429 / bot checks trigger a global back-off. If YouTube starts demanding
   sign-in, pass `--cookies cookies.txt`, and keep yt-dlp updated.
-* Budget: 1,000 h at 30 fps is about 108M frames. At CRF 10 yuv444p that's roughly 0.5–1.5 MB per
-  20 s clip, i.e. ~0.1–0.3 GB per hour of data. Download is ~1.8 GB per source hour at 720p60, so
-  5k h means ~9 TB to transfer. Use `--workers` sized to your bandwidth.
+* Budget (measured on a real 2D clip; busier games cost more): **~0.10 GB per hour of data** at 15 fps,
+  CRF 18 (0.066 at CRF 22). Downloads stream to a temp dir that's deleted per clip: ~0.15 GB per source hour
+  at 360–480p, never kept on disk. With `05 --delete-processed` only one copy exists at a time, so 350 GB
+  of free space holds ~3,000+ h. Stage 03 stops at `--min-free-gb`, and because of the balanced-first
+  order whatever fits is a per-game-capped subset.
+* **Routing downloads through a home connection** (when YouTube bot-blocks the cloud IP):
+  ```bash
+  # Mac / home machine (keep it awake: caffeinate -i)
+  pip install proxy.py && proxy --hostname 127.0.0.1 --port 8899
+  ssh -N -o ServerAliveInterval=30 -R 8899:127.0.0.1:8899 user@cloud-box
+  # cloud box
+  python 03_download_and_process.py --proxy http://127.0.0.1:8899 --workers 8
+  ```
+  An HTTP proxy works for both yt-dlp and ffmpeg's stream fetch. Stream URLs are tied to the IP that
+  resolved them, so both must go through the same proxy. Throughput is bounded by the home connection.
 
 ### 4. Caption frame 0
 ```bash

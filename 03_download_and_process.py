@@ -8,7 +8,8 @@ the closest aspect -> resize to cover it and centre-crop the small excess (<= --
 so there's no distortion and no bars. Clips with unusual aspect ratios fall back to fit+pad (recorded in pad/content_wh).
 
 Per chunk output (data/processed/<video_id>/<uuid>/):
-    frames.mp4    W x H (bucket, e.g. 336x192 for 16:9) H.264 yuv444p CRF 10, exactly T frames at --target-fps
+    frames.mp4    W x H (bucket, e.g. 336x192 for 16:9) H.264 yuv444p CRF 18 (~0.12 GB per hour of data, measured;
+                  41.6 dB PSNR vs CRF 10 on a real clip), exactly T frames at --target-fps
     actions.npy   (T, 21) float32 [j_left_x, j_left_y, j_right_x, j_right_y, 17 buttons], pooled to the
                   output fps (sticks: mean over the stride window, buttons: OR) so short taps survive
     frame0.png    first (inpainted) frame, used by the captioner
@@ -58,6 +59,13 @@ PERMANENT_ERR = re.compile(
 RATE_ERR = re.compile(r"(HTTP Error 429|too many requests|not a bot|sign in to confirm|rate.?limit)", re.I)
 
 
+class _NullLogger:
+    def debug(self, msg):
+        pass
+
+    warning = info = error = debug
+
+
 class PermanentError(Exception):
     pass
 
@@ -100,7 +108,8 @@ class StreamResolver:
         self.bot_streak = 0  # consecutive bot-check / 429 failures across all workers
 
     def ydl_opts(self, fmt: str) -> dict:
-        o = {"quiet": True, "no_warnings": True, "noplaylist": True, "format": fmt, "socket_timeout": 30}
+        o = {"quiet": True, "no_warnings": True, "noplaylist": True, "format": fmt, "socket_timeout": 30,
+             "logger": _NullLogger()}  # errors are captured from exceptions; keep the console clean
         if self.args.cookies:
             o["cookiefile"] = self.args.cookies
         if self.args.cookies_from_browser:
@@ -362,7 +371,8 @@ def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], f
     W, H = geo["W"], geo["H"]
     enc_cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
                "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", f"{fps_out:.6f}", "-i", "pipe:0",
-               "-c:v", args.vcodec, *args.enc_args.split(), "-g", str(args.gop), "-movflags", "+faststart",
+               "-c:v", args.vcodec, *args.enc_args.split(), "-g", str(args.gop or max(1, round(2 * fps_out))),
+               "-movflags", "+faststart",
                str(out_mp4)]
     with open(tmp / "enc.log", "wb") as enc_err:
         enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stderr=enc_err)
@@ -385,6 +395,17 @@ def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], f
     geo.update(crop_src=list(crop_src), src_wh=[src_w, src_h], analysis_wh=[aw, ah], borders=list(borders),
                inpaint_boxes=boxes, inpaint_frac=float((mask > 0).sum()) / max(1, W * H))
     return decoded, geo
+
+
+NOMINAL_FPS = (23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 120.0)
+
+
+def snap_fps(f: float) -> float:
+    """n_frames/duration is noisy for irregular chunks (e.g. 60.24); snap to the nominal rate within 2.5%."""
+    if not f or not np.isfinite(f):
+        return 30.0
+    best = min(NOMINAL_FPS, key=lambda n: abs(f / n - 1))
+    return best if abs(f / best - 1) < 0.025 else float(f)
 
 
 def fps_stride(fps_ann: float, target: float) -> int | None:
@@ -410,13 +431,14 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
     if not src_actions.exists():
         raise RuntimeError("staged actions missing")
     actions = np.load(src_actions)
-    fps_ann = float(row.fps or 30.0)
+    fps_ann = snap_fps(float(row.fps or 30.0))
     n_ann = int(actions.shape[0])
     stride = fps_stride(fps_ann, args.target_fps)
     if stride is None:
         raise PermanentError(f"annotation fps {fps_ann} is not an integer multiple of --target-fps {args.target_fps}")
     fps_out, n_out = fps_ann / stride, n_ann // stride
-    start = (row.start_frame / fps_ann) if pd.notna(row.start_frame) and row.start_frame is not None else float(row.start_time)
+    # metadata start_time is authoritative; start_frame/fps would drift if fps is even slightly off
+    start = float(row.start_time) if pd.notna(row.start_time) else float(row.start_frame) / fps_ann
     dur = n_ann / fps_ann
     url = row.url if isinstance(row.url, str) and row.url else f"https://www.youtube.com/watch?v={row.video_id}"
     # small embedded game areas need a higher-res source to survive the crop
@@ -612,19 +634,19 @@ def main():
     ap.add_argument("--border-thresh", type=float, default=24.0, help="max brightness (0-255) of a bar")
     ap.add_argument("--analysis-max-dim", type=int, default=0,
                     help="intermediate decode size (long side); 0 = auto (>= 1.5x the largest bucket side)")
-    ap.add_argument("--target-fps", type=float, default=30.0,
-                    help="output fps (0 = native). Per-chunk integer stride: 60->30 keeps every 2nd frame, 30->30 "
-                         "keeps all; actions pooled over each stride window (sticks mean, buttons OR)"),
+    ap.add_argument("--target-fps", type=float, default=15.0,
+                    help="output fps (0 = native). Per-chunk integer stride: 60->15 keeps every 4th frame, 30->15 "
+                         "every 2nd; actions pooled over each stride window (sticks mean, buttons OR, so taps survive)"),
     ap.add_argument("--mask-others", action=argparse.BooleanOptionalAction, default=True,
                     help="also inpaint bbox_others regions (webcams, banners)")
     ap.add_argument("--mask-dilate", type=int, default=2, help="mask dilation in output pixels")
     ap.add_argument("--inpaint-radius", type=float, default=3.0)
     ap.add_argument("--max-pad-frames", type=int, default=6, help="max tail frames to pad by repetition")
     ap.add_argument("--vcodec", default="libx264", help="libx264 | h264_nvenc | libx265 ...")
-    ap.add_argument("--enc-args", default="-preset medium -crf 10 -pix_fmt yuv444p",
+    ap.add_argument("--enc-args", default="-preset medium -crf 18 -pix_fmt yuv444p",
                     help="encoder args; lossless: '-preset veryslow -crf 0 -pix_fmt yuv444p'; "
                          "NVENC: '-preset p7 -tune hq -rc constqp -qp 10 -pix_fmt yuv444p'")
-    ap.add_argument("--gop", type=int, default=60)
+    ap.add_argument("--gop", type=int, default=0, help="keyframe interval in frames; 0 = 2 s at the output fps")
     ap.add_argument("--url-ttl", type=float, default=3 * 3600)
     ap.add_argument("--download-timeout", type=float, default=300)
     ap.add_argument("--min-free-gb", type=float, default=50.0)
@@ -671,7 +693,7 @@ def main():
     todo = man[~done_mask]
     if not args.retry_failed:
         todo = todo[todo.uuid.map(lambda u: failed.get(u, {}).get("kind") != "permanent")]
-    ok_fps = todo.fps.map(lambda f: fps_stride(float(f), args.target_fps) is not None)
+    ok_fps = todo.fps.map(lambda f: fps_stride(snap_fps(float(f)), args.target_fps) is not None)
     if (~ok_fps).any():
         log.warning("Skipping %d chunks whose fps can't reach --target-fps %.0f with an integer stride: %s",
                     (~ok_fps).sum(), args.target_fps, todo.fps[~ok_fps].round().value_counts().to_dict())

@@ -424,9 +424,9 @@ def main():
     ap.add_argument("--alpha", type=float, default=None, help="use this exponent directly instead of solving")
     ap.add_argument("--allocation", choices=["power", "cap"], default="power",
                     help="power: floor(n_g**alpha) solved for --target-hours; cap: per-game hour cap solved for it")
-    ap.add_argument("--est-disk-gb-per-hour", type=float, default=0.3)
-    ap.add_argument("--est-download-gb-per-hour", type=float, default=0.6,
-                    help="source download per hour of data (~0.6 GB at 480p30, ~1.8 GB at 720p60)")
+    ap.add_argument("--est-disk-gb-per-hour", type=float, default=0.10, help="processed clips @ 15 fps, CRF 18 (measured)")
+    ap.add_argument("--est-download-gb-per-hour", type=float, default=0.15,
+                    help="source download per hour of data (~0.15 GB measured at 360p VP9; ~1.8 GB at 720p60)")
     ap.add_argument("--val-frac", type=float, default=0.10, help="fraction of games held out")
     ap.add_argument("--val-max-hours-pct", type=float, default=90.0,
                     help="only games at or below this percentile of hours are eligible for holdout")

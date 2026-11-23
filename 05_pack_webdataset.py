@@ -57,6 +57,9 @@ def main():
     ap.add_argument("--drop-dark-frame0", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--delete-processed", action="store_true",
+                    help="delete each processed clip dir once the shard containing it is closed (halves peak disk; "
+                         "processed/ can't be re-packed afterwards)")
     args = ap.parse_args()
 
     import webdataset as wds
@@ -86,6 +89,15 @@ def main():
         drops = {"not_processed": 0, "no_caption": 0, "vlm_3d": 0, "dark": 0, "bad_shape": 0}
         stats: dict[str, dict] = {}   # bucket -> {samples, frames, hours, width, height}
         writers: dict[str, "wds.ShardWriter"] = {}
+        pending_del: dict[str, list[Path]] = {}  # bucket -> clip dirs whose shard is still open
+        n_deleted = 0
+
+        def flush_deletes(dirs: list[Path]):
+            nonlocal n_deleted
+            for dd in dirs:
+                shutil.rmtree(dd, ignore_errors=True)
+                n_deleted += 1
+            dirs.clear()
         try:
             for row in tqdm(sm.itertuples(index=False), total=len(sm), desc=f"pack {split}"):
                 d = processed_dir_for(args.processed_dir, row.video_id, row.uuid)
@@ -141,7 +153,13 @@ def main():
                     fbuf = io.BytesIO()
                     np.save(fbuf, decode_mp4(d / "frames.mp4"))
                     sample["frames.npy"] = fbuf.getvalue()
-                writers[bucket].write(sample)
+                w = writers[bucket]
+                shard_before = getattr(w, "shard", None)
+                w.write(sample)
+                if args.delete_processed:
+                    if getattr(w, "shard", None) != shard_before and shard_before is not None:
+                        flush_deletes(pending_del.setdefault(bucket, []))  # previous shard is closed on disk
+                    pending_del.setdefault(bucket, []).append(d)
                 st = stats[bucket]
                 st["samples"] += 1
                 st["frames"] += int(meta["n_frames"])
@@ -149,6 +167,10 @@ def main():
         finally:
             for w in writers.values():
                 w.close()
+        if args.delete_processed:  # all shards closed successfully
+            for dirs in pending_del.values():
+                flush_deletes(dirs)
+            log.info("[%s] deleted %s processed clip dirs after packing", split, f"{n_deleted:,}")
         for b, st in stats.items():
             st["shards"] = sorted(f"{b}/{p.name}" for p in (sdir / b).glob("*.tar"))
             st["hours"] = round(st["hours"], 2)
