@@ -90,3 +90,30 @@ def augment_fake_boxes(valid: np.ndarray, rng: np.random.Generator, p: float = 0
         y, x = rng.integers(0, H - h + 1), rng.integers(0, W - w + 1)
         v[y:y + h, x:x + w] = 0
     return v
+
+
+def fit_to_canvas(frames: np.ndarray, valid: np.ndarray, W: int, H: int, max_crop: float = 0.05):
+    """Map a clip stored at its own bucket onto a training canvas chosen later (e.g. one 16:9 canvas).
+
+    frames: (T, h, w, 3) uint8; valid: (h, w) loss mask from pixel_valid_mask(). Keeps the aspect ratio:
+    if it is within `max_crop` of the canvas, scale to cover and centre-crop; otherwise scale to fit and pad
+    with black. Returns (frames (T, H, W, 3), valid (H, W)) with padded pixels marked invalid."""
+    import cv2
+    T, h, w = frames.shape[:3]
+    a, t = w / h, W / H
+    cover = 1 - min(a / t, t / a) <= max_crop
+    s = max(W / w, H / h) if cover else min(W / w, H / h)
+    nw, nh = max(1, round(w * s)), max(1, round(h * s))
+    rf = np.stack([cv2.resize(f, (nw, nh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR) for f in frames])
+    rv = cv2.resize(valid.astype(np.float32), (nw, nh), interpolation=cv2.INTER_NEAREST)
+    out_f = np.zeros((T, H, W, 3), np.uint8)
+    out_v = np.zeros((H, W), np.float32)
+    if cover:  # centre-crop the small excess
+        x0, y0 = (nw - W) // 2, (nh - H) // 2
+        out_f[:] = rf[:, y0:y0 + H, x0:x0 + W]
+        out_v[:] = rv[y0:y0 + H, x0:x0 + W]
+    else:      # pad (letter/pillarbox); padding is excluded from the loss
+        x0, y0 = (W - nw) // 2, (H - nh) // 2
+        out_f[:, y0:y0 + nh, x0:x0 + nw] = rf
+        out_v[y0:y0 + nh, x0:x0 + nw] = rv
+    return out_f, out_v

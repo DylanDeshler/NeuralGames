@@ -98,7 +98,6 @@ games_2d:
     - "The Jetsons: Invasion of the Planet Pirates"
     - "Kirby's Adventure"
     - "Donkey Kong Country Returns HD"
-    - "The Binding of Isaac: Repentance"
     - Celeste
     - Cuphead
     - "Cuphead: The Delicious Last Course"
@@ -280,6 +279,7 @@ games_2d:
     - Galaxian
     - Bubble Bobble
   2D Action:
+    - "The Binding of Isaac: Repentance"
     - "The Legend of Zelda: A Link to the Past"
     - "The Legend of Zelda: Minish Cap"
     - "The Legend of Zelda: Link's Awakening DX"
