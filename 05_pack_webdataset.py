@@ -45,8 +45,9 @@ def decode_mp4(path: Path) -> np.ndarray:
 
 def name_check(man: pd.DataFrame, args, out: Path, log) -> set[str]:
     """Compare each video's label with the game stage 04's VLM recognizes in its frames (majority over the
-    video's clips). Writes name_mismatch_report.csv; returns val videos that look like a TRAIN game."""
-    if not args.val_leak_check or "vlm_game_title" not in man.columns or man["vlm_game_title"].notna().sum() == 0:
+    video's clips). Writes name_mismatch_report.csv (informational: VLM titles are unreliable); returns val videos
+    that look like a TRAIN game only when --val-leak-check is on."""
+    if "vlm_game_title" not in man.columns or man["vlm_game_title"].notna().sum() == 0:
         log.info("Name check skipped (no vlm_game_title in the manifest; run stage 04 first)")
         return set()
     lab = GameLabeler(Path(args.genres), Path(args.labels_csv) if args.labels_csv else None)
@@ -62,7 +63,7 @@ def name_check(man: pd.DataFrame, args, out: Path, log) -> set[str]:
     hours = man.groupby("video_id")["duration"].sum() / 3600
     rep["hours"] = hours.reindex(rep.index).round(2)
     rep.sort_values("hours", ascending=False).to_csv(out / "name_mismatch_report.csv")
-    leak = set(rep.index[(rep["split"] == "val_unseen_games") & rep["vlm_key_in_train"]])
+    leak = set(rep.index[(rep["split"] == "val_unseen_games") & rep["vlm_key_in_train"]]) if args.val_leak_check else set()
     log.info("Name check: %d of %d checked videos disagree with their label (%.0f h, see name_mismatch_report.csv); "
              "%d val videos look like a train game -> dropped from val", len(rep), len(title), rep["hours"].sum(), len(leak))
     return leak
@@ -86,8 +87,10 @@ def main():
                          "(menus, title/option screens, loading, emulator UIs). 0 disables")
     ap.add_argument("--require-frame0-gameplay", action=argparse.BooleanOptionalAction, default=True,
                     help="drop clips whose first frame (the caption / text-to-world conditioning frame) isn't gameplay")
-    ap.add_argument("--val-leak-check", action=argparse.BooleanOptionalAction, default=True,
-                    help="drop val_unseen_games videos whose frames the VLM recognizes as a different game that is in train")
+    ap.add_argument("--val-leak-check", action=argparse.BooleanOptionalAction, default=False,
+                    help="drop val_unseen_games videos whose frames the VLM 'recognizes' as a different train game. OFF by "
+                         "default: in smoke tests the VLM's title guesses on small frames were mostly wrong (3/3 false drops). "
+                         "The mismatch report is still written for manual review.")
     ap.add_argument("--genres", default="./config/genres_2d.yaml")
     ap.add_argument("--labels-csv", default="./config/game_labels.csv")
     ap.add_argument("--max-black-frac", type=float, default=0.25,

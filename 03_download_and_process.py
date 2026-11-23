@@ -263,6 +263,27 @@ def detect_borders(frames: list[np.ndarray], thresh: float, min_frac: float = 0.
     return L, T, R, B
 
 
+def static_bottom_band(frames: list[np.ndarray], borders, min_frac: float = 0.02, max_frac: float = 0.12,
+                       static_std: float = 4.0, static_share: float = 0.90) -> int:
+    """Rows to trim at the bottom: a stream status bar is (almost) unchanged for the whole clip while the game
+    above it moves. Returns the band height in analysis px (0 if none). Only used for stream-layout videos."""
+    L, T, R, B = borders
+    sample = frames[:: max(1, len(frames) // 60)]
+    g = np.stack([f[T:f.shape[0] - B, L:f.shape[1] - R].mean(axis=2) for f in sample]).astype(np.float32)
+    if g.shape[0] < 10:
+        return 0
+    static_rows = (g.std(axis=0) < static_std).mean(axis=1) >= static_share  # per row: share of static pixels
+    h = len(static_rows)
+    n = 0
+    while n < h and static_rows[h - 1 - n]:
+        n += 1
+    if not (min_frac * h <= n <= max_frac * h):
+        return 0
+    share = (g.std(axis=0) < static_std).mean(axis=1)
+    band, above = share[h - n:].mean(), share[max(0, h - n - int(0.10 * h)): h - n].mean()
+    return n if band - above >= 0.10 else 0  # bar must be clearly more static than the game just above it
+
+
 def choose_bucket(cw: int, ch: int, buckets: list[tuple[int, int]], patch: int, max_crop: float) -> dict:
     """Pick the bucket with the least aspect mismatch (ties -> more tokens).
 
@@ -375,6 +396,10 @@ def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], f
     frames += [frames[-1]] * (n_out - decoded)  # tiny tail deficit (rounding at clip end): repeat last frame
 
     borders = detect_borders(frames, args.border_thresh) if args.detect_borders else (0, 0, 0, 0)
+    if args.trim_static_bars and bool(getattr(row, "stream_layout", False)):
+        band = static_bottom_band(frames, borders)
+        if band:
+            borders = (borders[0], borders[1], borders[2], borders[3] + band)  # trimmed like a bottom bar
     L, T, R, B = borders
     geo = choose_bucket(aw - L - R, ah - T - B, args.bucket_list, args.patch, args.max_crop)
     mask, boxes = build_mask(overlay_boxes_src(row, src_w, src_h, args.mask_others), crop_src, (aw, ah),
@@ -629,6 +654,7 @@ def apply_layout_overrides(man: pd.DataFrame, args, log) -> pd.DataFrame:
     man["bbox_game_area"] = new_ga
     fill = pd.Series(changed, index=man.index)
     man["layout_override"] = fill
+    man["stream_layout"] = vid.map(ok["stream_layout"]).fillna(False).astype(bool) if "stream_layout" in ok else False
     if suspicious:
         log.warning("Layout: %d chunks where the 02c box barely overlaps the metadata box -> kept metadata", suspicious)
     with_ov = vid.isin(ok.index[ok["overlays"].fillna("[]") != "[]"])
@@ -704,6 +730,9 @@ def main():
                          "list 'WxH,...' in patches, e.g. '21x12,19x14,16x16'")
     ap.add_argument("--max-crop", type=float, default=0.05,
                     help="max fraction of the content cropped to fill a bucket; beyond this, pad instead")
+    ap.add_argument("--trim-static-bars", action=argparse.BooleanOptionalAction, default=True,
+                    help="for videos 02c flagged as stream layouts, trim a bottom strip that stays static all clip "
+                         "(stream status bars the VLM missed)")
     ap.add_argument("--detect-borders", action=argparse.BooleanOptionalAction, default=True,
                     help="detect static black pillar/letterbox bars inside the video (4:3 game in a 16:9 video)")
     ap.add_argument("--border-thresh", type=float, default=24.0, help="max brightness (0-255) of a bar")
