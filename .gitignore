@@ -1,11 +1,6 @@
 # ---- secrets / credentials ----
-youtube_api_key.txt
-*api_key*
-*.key
 .env
 .env.*
-cookies.txt
-*cookies*.txt
 .netrc
 
 # ---- pipeline outputs (live under $NG_DATA_ROOT, default ./data) ----

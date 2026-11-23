@@ -27,9 +27,10 @@ from pathlib import Path
 
 import atexit
 import json
+import os
 import urllib.request
 
-from ng_common import DATA_ROOT, DEFAULT_VLM, setup_logging
+from ng_common import DATA_ROOT, DEFAULT_VLM, REPO_COOKIES, setup_logging
 
 HERE = Path(__file__).resolve().parent
 PY = sys.executable
@@ -157,6 +158,26 @@ def require_js_runtime(a, log) -> None:
                          "PATH=$HOME/.deno/bin:$PATH ; pip install -U 'yt-dlp[default]'  (or pass --allow-no-js)")
 
 
+def check_direct_access(a, log) -> None:
+    """Direct (no-proxy) downloads from a datacenter IP need cookies + the bgutil PO-token server."""
+    if a.dry_run or a.proxy:
+        return
+    if a.cookies and not os.path.isfile(a.cookies):
+        raise StepFailed(f"--cookies {a.cookies} does not exist")
+    if not a.cookies:
+        if REPO_COOKIES.is_file():
+            log.info("Using repo cookies %s (stages copy it to $NG_DATA_ROOT/cookies_runtime.txt)", REPO_COOKIES.name)
+        else:
+            log.warning("No --proxy and no cookies (--cookies or %s): YouTube usually bot-blocks datacenter IPs. "
+                        "See README 'Cloud access with cookies' / tools/setup_youtube_access.sh.", REPO_COOKIES.name)
+    import socket
+    try:
+        socket.create_connection(("127.0.0.1", 4416), timeout=3).close()
+    except OSError:
+        log.warning("bgutil PO-token server not reachable on 127.0.0.1:4416; downloads may be blocked or throttled. "
+                    "Start it: bash tools/setup_youtube_access.sh  (or docker start bgutil-provider)")
+
+
 def require_proxy(a, log, wait: bool) -> None:
     if a.dry_run or proxy_ok(a.proxy):
         return
@@ -197,6 +218,7 @@ def smoke(a, log):
     failed = None
     try:
         require_js_runtime(a, log)
+        check_direct_access(a, log)
         require_proxy(a, log, wait=False)
         if a.start_vlm_server:
             start_vlm_server(a, log)
@@ -259,6 +281,7 @@ def bulk(a, log):
     if a.resample:
         resample(a, log)
     require_js_runtime(a, log)
+    check_direct_access(a, log)
     if a.start_vlm_server:
         start_vlm_server(a, log)
     bg02c = None
@@ -316,7 +339,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["smoke", "bulk"])
     ap.add_argument("--proxy", default=None, help="e.g. http://127.0.0.1:8899 (passed to 02c and 03)")
-    ap.add_argument("--cookies", default=None)
+    ap.add_argument("--cookies", default=None, help="default: repo www.youtube.com_cookies.txt if present")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--clips", type=int, default=20, help="smoke: clips to process")
     ap.add_argument("--cycle-clips", type=int, default=20000, help="bulk: clips per download/pack cycle (~110 h)")

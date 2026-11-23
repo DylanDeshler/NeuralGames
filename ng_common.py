@@ -45,6 +45,30 @@ STICK_THRESHOLDS = (0.1, 0.2, 0.3)
 # Root for ALL pipeline outputs (metadata, manifests, clips, shards, caches, logs).
 # Set once:  export NG_DATA_ROOT=/data/games
 DATA_ROOT = Path(os.environ.get("NG_DATA_ROOT", "./data")).expanduser()
+
+# YouTube cookies (throwaway account) checked into the repo root; used when --cookies isn't given.
+REPO_COOKIES = Path(__file__).resolve().parent / "www.youtube.com_cookies.txt"
+
+
+def default_cookies(explicit: str | None = None) -> str | None:
+    """Cookie file to hand to yt-dlp: --cookies if given, else the repo's www.youtube.com_cookies.txt.
+
+    yt-dlp rewrites its cookie file as sessions refresh, so we give it a working copy under DATA_ROOT
+    (refreshed whenever the source is newer) and the tracked file in the repo stays unchanged."""
+    src = Path(explicit).expanduser() if explicit else REPO_COOKIES
+    if not src.is_file():
+        return explicit  # let the caller fail loudly on a bad explicit path; None = no cookies
+    dst = DATA_ROOT / "cookies_runtime.txt"
+    try:
+        if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_bytes(src.read_bytes())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, dst)
+        return str(dst)
+    except OSError:
+        return str(src)
 # Keep HF model/dataset caches (Qwen weights ~15-30 GB each) on the same disk unless HF_HOME is already set.
 os.environ.setdefault("HF_HOME", str(DATA_ROOT / "hf_cache"))
 

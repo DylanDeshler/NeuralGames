@@ -50,7 +50,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 from tqdm import tqdm
 
-from ng_common import DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, free_gb, processed_dir_for, setup_logging
+from ng_common import default_cookies, DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, free_gb, processed_dir_for, setup_logging
 
 PERMANENT_ERR = re.compile(
     r"(private video|video unavailable|video is unavailable|does not exist|has been removed|no longer available|account associated|"
@@ -821,7 +821,7 @@ def main():
     ap.add_argument("--url-ttl", type=float, default=3 * 3600)
     ap.add_argument("--download-timeout", type=float, default=300)
     ap.add_argument("--min-free-gb", type=float, default=50.0)
-    ap.add_argument("--cookies", default=None)
+    ap.add_argument("--cookies", default=None, help="Netscape cookies.txt (default: repo www.youtube.com_cookies.txt if present)")
     ap.add_argument("--cookies-from-browser", default=None)
     ap.add_argument("--proxy", default=None,
                     help="proxy for yt-dlp AND the ffmpeg fetch (googlevideo URLs are IP-bound), e.g. "
@@ -836,6 +836,7 @@ def main():
     ap.add_argument("--min-video-gameplay-frac", type=float, default=0.0,
                     help="skip videos where 02c saw gameplay in fewer than this fraction of its probe frames")
     args = ap.parse_args()
+    args.cookies = default_cookies(args.cookies)
 
     args.bucket_list = (auto_buckets(CANONICAL_BUCKETS, args.max_crop) if args.buckets == "auto"
                         else parse_buckets(args.buckets))

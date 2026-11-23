@@ -39,7 +39,7 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from ng_common import (DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, openai_chat_many, setup_logging, strip_thinking,
+from ng_common import (default_cookies, DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, openai_chat_many, setup_logging, strip_thinking,
                        vllm_chat_kwargs, vllm_mm_kwargs)
 
 _spec = importlib.util.spec_from_file_location("stage03", Path(__file__).with_name("03_download_and_process.py"))
@@ -413,7 +413,7 @@ def main():
     ap.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     # network (same semantics as stage 03)
     ap.add_argument("--proxy", default=None)
-    ap.add_argument("--cookies", default=None)
+    ap.add_argument("--cookies", default=None, help="Netscape cookies.txt (default: repo www.youtube.com_cookies.txt if present)")
     ap.add_argument("--cookies-from-browser", default=None)
     ap.add_argument("--max-starts-per-min", type=float, default=60.0, help="URL resolutions per minute (1 per video)")
     ap.add_argument("--rate-penalty", type=float, default=120.0)
@@ -425,6 +425,7 @@ def main():
     ap.add_argument("--patch", type=int, default=16, help="only for the predicted-bucket report")
     ap.add_argument("--max-src-height", type=int, default=480, help="probe-frame resolution (layout needs little detail)")
     args = ap.parse_args()
+    args.cookies = default_cookies(args.cookies)
 
     log = setup_logging("02c_detect_layout")
     man = pd.read_parquet(args.manifest, columns=["video_id", "url", "start_time", "duration", "chunk_id",

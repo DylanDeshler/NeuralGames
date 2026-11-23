@@ -80,6 +80,20 @@ YouTube often answers datacenter IPs with "Sign in to confirm you're not a bot".
   `bgutil-ytdlp-pot-provider` PO-token plugin for yt-dlp; or `--proxy http://user:pass@host:port`
   (applied to both yt-dlp and the ffmpeg fetch, since the stream URLs are tied to the IP that
   resolved them).
+* **Cloud access with cookies (recommended over the home tunnel).**
+  1. Create a throwaway Google account (don't use your main one; it can be rate-limited or flagged).
+     Open youtube.com in a fresh private/incognito window, sign in, watch a video or two.
+  2. In that same private window, export cookies for youtube.com with a "Get cookies.txt" style extension,
+     **then close the window without signing out** (signing out invalidates them). Or run, on your laptop:
+     `yt-dlp --cookies-from-browser firefox --cookies cookies.txt --skip-download "https://youtu.be/BaW_jenozKc"`.
+  3. Save them as `www.youtube.com_cookies.txt` in the repo root and commit them, then `git pull` on the GPU box.
+     Every stage uses that file automatically when `--cookies` isn't given. yt-dlp works on a copy at
+     `$NG_DATA_ROOT/cookies_runtime.txt`, so the tracked file doesn't change.
+  4. On the box, run `bash tools/setup_youtube_access.sh`. It installs deno, `yt-dlp[default]` and the
+     bgutil PO-token plugin, starts the provider on 127.0.0.1:4416 (Docker, or a Node build if Docker is
+     missing), and checks that you get a PO token and an unthrottled download.
+  5. Run the pipeline with **no** `--proxy`. Cookies last weeks to months. If the bot errors come back,
+     export fresh ones (step 2), commit, pull.
 * Both stages stop early with a clear message after repeated bot checks (`--max-bot-streak`) instead
   of grinding. Progress is cached, so just re-run once access is fixed.
 
