@@ -44,24 +44,26 @@ _spec = importlib.util.spec_from_file_location("stage03", Path(__file__).with_na
 S3 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(S3)
 
-PROMPT = """This is a frame from a gameplay video. It may be a stream layout: besides the game itself the frame can
-contain a webcam, a chat panel, follower/donation alerts, a controller/input display, logos, text panels,
-decorative borders or a blurred/zoomed copy of the game used as a background.
+PROMPT_GAME = """This is a frame from a gameplay video. It may be a livestream layout, where the game picture is only
+one rectangle of the frame and the rest is chat, a webcam, a status bar, borders or a background.
 
-Return JSON only:
-{"game_box": [x1, y1, x2, y2],
- "layout_panels": [[x1, y1, x2, y2], ...],
- "overlays_in_game": [[x1, y1, x2, y2], ...],
- "screen": "gameplay|menu|title|loading|cutscene|map_or_inventory|black|not_a_game",
- "is_stream_layout": true|false}
+Find the rectangle that shows ONLY the game's own picture. Return JSON only:
+{"game_box": [x1, y1, x2, y2], "screen": "gameplay|menu|title|loading|cutscene|map_or_inventory|black|not_a_game"}
 
-- game_box: the rectangle of the actual game screen only. It must EXCLUDE chat columns, webcam frames, stream
-  status/ticker bars (streamer name, donation goals, follower counts, clocks), decorative borders/bezels and
-  blurred backgrounds. If the game fills the whole frame, return the full frame.
-- layout_panels: every non-game region of the frame (chat, webcam, status/ticker bar, borders, bezels), one box each.
-- overlays_in_game: small webcam / logo / input-display boxes that sit ON TOP of the game picture (often empty).
-  Never return the whole game screen here, and do not list the game's own HUD (health bars, score, minimap).
-- Coordinates are pixels in this image ({w}x{h})."""
+The game picture is where the game world, its characters and its own HUD are drawn. Its edges are usually straight
+lines where the picture meets a chat column, a bar of text/icons, a frame, or a different background. If the game
+fills the entire frame, return the entire frame. Coordinates are pixels in this {w}x{h} image."""
+
+PROMPT_LAYOUT = """This is a frame from a gameplay video. List every livestream/recording element that is NOT part of
+the game itself. Return JSON only:
+{"elements": [{"type": "chat|webcam|status_bar|border|background|alert|input_display|logo|other", "box": [x1, y1, x2, y2]}, ...]}
+
+- chat: a column/panel of chat messages.  webcam: a camera image of a person.
+- status_bar: a strip with streamer name, donation/follower goals, counters, clock, social handles, emoji/icons.
+- border: decorative frame or bezel art around the game; background: blurred or decorative area outside the game.
+- input_display: an on-screen controller/keyboard showing pressed buttons.
+Do NOT list the game's own HUD (health bars, score, lives, minimap, timer drawn by the game).
+Return {"elements": []} if the game fills the frame with nothing else. Coordinates are pixels in this {w}x{h} image."""
 
 
 def fit28(w: int, h: int, long_side: int = 560) -> tuple[int, int]:
@@ -77,42 +79,75 @@ def to_data_uri(img: Image.Image) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def parse(text: str, w: int, h: int) -> dict | None:
+def _json(text: str):
     m = re.search(r"\{.*\}", text or "", re.S)
     if not m:
         return None
     try:
-        d = json.loads(m.group(0))
+        return json.loads(m.group(0))
     except json.JSONDecodeError:
         return None
 
-    def box(b):
-        if not isinstance(b, (list, tuple)) or len(b) != 4:
-            return None
-        try:
-            x1, y1, x2, y2 = (float(v) for v in b)
-        except (TypeError, ValueError):
-            return None
-        x1, x2 = sorted((min(max(x1, 0), w), min(max(x2, 0), w)))
-        y1, y2 = sorted((min(max(y1, 0), h), min(max(y2, 0), h)))
-        if x2 - x1 < 0.05 * w or y2 - y1 < 0.05 * h:
-            return None
-        return [x1 / w, y1 / h, x2 / w, y2 / h]  # relative
 
-    g = box(d.get("game_box"))
+def _box(b, w: int, h: int):
+    if not isinstance(b, (list, tuple)) or len(b) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = (float(v) for v in b)
+    except (TypeError, ValueError):
+        return None
+    x1, x2 = sorted((min(max(x1, 0), w), min(max(x2, 0), w)))
+    y1, y2 = sorted((min(max(y1, 0), h), min(max(y2, 0), h)))
+    if x2 - x1 < 0.03 * w or y2 - y1 < 0.02 * h:
+        return None
+    return [x1 / w, y1 / h, x2 / w, y2 / h]  # relative
+
+
+PANEL_TYPES = {"chat", "status_bar", "border", "background", "alert", "other", "logo"}
+OVERLAY_TYPES = {"webcam", "input_display", "logo", "alert"}
+
+
+def parse_game(text: str, w: int, h: int) -> dict | None:
+    d = _json(text)
+    g = _box(d.get("game_box"), w, h) if isinstance(d, dict) else None
+    return {"game": g, "screen": str(d.get("screen", "")).lower()} if g else None
+
+
+def parse_layout(text: str, w: int, h: int) -> list[tuple[str, list[float]]] | None:
+    d = _json(text)
+    if not isinstance(d, dict) or not isinstance(d.get("elements"), list):
+        return None
+    out = []
+    for e in d["elements"]:
+        if isinstance(e, dict):
+            b = _box(e.get("box"), w, h)
+            if b and (b[2] - b[0]) * (b[3] - b[1]) <= 0.6:  # "element" covering most of the frame = the game itself
+                out.append((str(e.get("type", "other")).lower(), b))
+    return out
+
+
+def parse(text: str, w: int, h: int) -> dict | None:
+    """Back-compat single-prompt parser (game_box + overlays_in_game/layout_panels)."""
+    d = _json(text)
+    if not isinstance(d, dict):
+        return None
+    g = _box(d.get("game_box"), w, h)
     if g is None:
         return None
-    raw = list(d.get("overlays_in_game") or []) + list(d.get("layout_panels") or [])
-    ovs = []
-    for b in (box(o) for o in raw):
-        if b is None:
-            continue
-        area = (b[2] - b[0]) * (b[3] - b[1])
-        if area > 0.6:  # "overlay" covering most of the frame = the model echoing the game screen: ignore
-            continue
-        ovs.append(b)
-    return {"game": g, "overlays": ovs, "screen": str(d.get("screen", "")).lower(),
+    els = [("other", b) for b in (_box(o, w, h) for o in list(d.get("overlays_in_game") or []) + list(d.get("layout_panels") or []))
+           if b is not None and (b[2] - b[0]) * (b[3] - b[1]) <= 0.6]
+    return {"game": g, "overlays": [b for _, b in els], "elements": els, "screen": str(d.get("screen", "")).lower(),
             "stream": bool(d.get("is_stream_layout", False))}
+
+
+def combine(game: dict | None, elements: list | None) -> dict | None:
+    """One frame: game box from the game question, refined by the elements from the layout question."""
+    if game is None and elements is None:
+        return None
+    g = game["game"] if game else [0.0, 0.0, 1.0, 1.0]
+    els = elements or []
+    return {"game": g, "overlays": [b for _, b in els], "elements": els,
+            "screen": game["screen"] if game else "", "stream": bool(els) or g != [0.0, 0.0, 1.0, 1.0]}
 
 
 # ============================================================================ frame grabbing
@@ -207,7 +242,8 @@ def aggregate(results: list[dict], full_thresh: float) -> dict:
         else:
             gw, gh = max(g[2] - g[0], 1e-6), max(g[3] - g[1], 1e-6)
             frac = (o[2] - o[0]) * (o[3] - o[1]) / (gw * gh)
-            if 0.025 <= frac <= 0.30:  # webcam-sized: inpaint. Tiny = HUD bits; huge = not an overlay
+            inside = (min(o[2], g[2]) - max(o[0], g[0])) > 0 and (min(o[3], g[3]) - max(o[1], g[1])) > 0
+            if inside and 0.015 <= frac <= 0.30:  # webcam / input display on top of the picture: inpaint
                 inner.append(o)
     keep = inner
     area = (g[2] - g[0]) * (g[3] - g[1])
@@ -233,7 +269,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=32, help="videos per VLM batch")
-    ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
+    ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct",
+                    help="Qwen/Qwen2.5-VL-32B-Instruct-AWQ is noticeably better at layouts and fits a 48 GB GPU")
     ap.add_argument("--gpu-mem", type=float, default=0.85)
     ap.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     # network (same semantics as stage 03)
@@ -307,16 +344,22 @@ def main():
             if not frames:
                 rows.append({"video_id": v, "status": err or "no_frames"})
                 continue
-            for f in frames:
+            for fi, f in enumerate(frames):
                 w, h = fit28(*f.size)
-                convs.append([{"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": to_data_uri(f.resize((w, h), Image.Resampling.BICUBIC))}},
-                    {"type": "text", "text": PROMPT.replace("{w}", str(w)).replace("{h}", str(h))}]}])
-                owners.append((v, w, h))
+                uri = to_data_uri(f.resize((w, h), Image.Resampling.BICUBIC))
+                for kind, prompt in (("game", PROMPT_GAME), ("layout", PROMPT_LAYOUT)):  # two focused questions
+                    convs.append([{"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": uri}},
+                        {"type": "text", "text": prompt.replace("{w}", str(w)).replace("{h}", str(h))}]}])
+                    owners.append((v, fi, kind, w, h))
         outs = llm.chat(convs, sp, use_tqdm=False) if convs else []
+        answers: dict[tuple[str, int], dict] = {}
+        for (v, fi, kind, w, h), o in zip(owners, outs):
+            txt = o.outputs[0].text
+            answers.setdefault((v, fi), {})[kind] = parse_game(txt, w, h) if kind == "game" else parse_layout(txt, w, h)
         per_vid: dict[str, list[dict]] = {}
-        for (v, w, h), o in zip(owners, outs):
-            r = parse(o.outputs[0].text, w, h)
+        for (v, fi), a in sorted(answers.items()):
+            r = combine(a.get("game"), a.get("layout"))
             if r:
                 per_vid.setdefault(v, []).append(r)
         for v, frames, err, method, secs in got:

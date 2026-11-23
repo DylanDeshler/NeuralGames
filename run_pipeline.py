@@ -41,8 +41,17 @@ def run(cmd: list[str], log, dry: bool, stdout_path: Path | None = None) -> None
     if dry:
         return
     t0 = time.time()
-    if stdout_path is None:
-        rc = subprocess.run(cmd, cwd=HERE).returncode
+    if stdout_path is None:  # stream to the console AND keep a copy (incl. tracebacks) for the bundle
+        (DATA_ROOT / "logs").mkdir(parents=True, exist_ok=True)
+        name = Path(cmd[1]).stem if len(cmd) > 1 else "step"
+        with open(DATA_ROOT / "logs" / f"console_{name}.log", "a") as tee:
+            tee.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {pretty}\n")
+            p = subprocess.Popen(cmd, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+            for chunk in iter(lambda: p.stdout.read(4096), b""):
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.flush()
+                tee.write(chunk.decode(errors="replace"))
+            rc = p.wait()
     else:
         with open(stdout_path, "w") as fh:
             rc = subprocess.run(cmd, cwd=HERE, stdout=fh).returncode
@@ -58,6 +67,10 @@ def net_args(a) -> list[str]:
     if a.cookies:
         out += ["--cookies", a.cookies]
     return out
+
+
+def layout_args(a) -> list[str]:
+    return ["--model", a.layout_model] if a.layout_model else []
 
 
 def count_clips(processed: Path) -> int:
@@ -82,30 +95,57 @@ def smoke(a, log):
         root.mkdir(parents=True, exist_ok=True)
         shutil.copy(man_main, man)  # isolated copy: 04/05 write into it, the real manifest stays untouched
         debug.mkdir(parents=True, exist_ok=True)
-    if not a.skip_layout:  # 02c results are shared with bulk (same videos, same answers)
-        run([PY, "02c_detect_layout.py", "--manifest", str(man), "--limit", str(max(40, 2 * a.clips)),
-             "--workers", str(a.workers), *net_args(a)], log, a.dry_run)
-    run([PY, "03_download_and_process.py", "--manifest", str(man), "--processed-dir", str(processed),
-         "--tmp-dir", str(tmp), "--limit", str(a.clips), "--workers", str(a.workers),
-         "--require-layout-check", "--min-video-gameplay-frac", str(a.min_video_gameplay_frac), *net_args(a)],
-        log, a.dry_run)
-    run([PY, "04_caption_frames.py", "--manifest", str(man), "--processed-dir", str(processed)], log, a.dry_run)
-    run([PY, "05_pack_webdataset.py", "--manifest", str(man), "--processed-dir", str(processed),
-         "--out", str(wds), "--overwrite"], log, a.dry_run)
+    failed = None
     try:
-        run([PY, "verify_dataset.py", "--root", str(wds), "--out-dir", str(debug), "--debug-videos", "2",
-             "--num-shards", "50"], log, a.dry_run, stdout_path=debug / "verify.txt")
-    except StepFailed as e:  # keep going: the bundle is most useful exactly when something failed
-        log.warning("%s (see debug/verify.txt)", e)
-    run([PY, "inspect_clips.py", "--processed-dir", str(processed), "--manifest", str(man)], log, a.dry_run,
-        stdout_path=debug / "inspect.txt")
-    if not a.dry_run:
-        for f in (wds / "name_mismatch_report.csv",):
-            if f.exists():
-                shutil.copy(f, debug / f.name)
-        bundle = root / "smoke_results.tgz"
+        if not a.skip_layout:  # 02c results are shared with bulk (same videos, same answers)
+            run([PY, "02c_detect_layout.py", "--manifest", str(man), "--limit", str(max(40, 2 * a.clips)),
+                 "--workers", str(a.workers), *layout_args(a), *net_args(a)], log, a.dry_run)
+        run([PY, "03_download_and_process.py", "--manifest", str(man), "--processed-dir", str(processed),
+             "--tmp-dir", str(tmp), "--limit", str(a.clips), "--workers", str(a.workers),
+             "--require-layout-check", "--min-video-gameplay-frac", str(a.min_video_gameplay_frac), *net_args(a)],
+            log, a.dry_run)
+        run([PY, "04_caption_frames.py", "--manifest", str(man), "--processed-dir", str(processed)], log, a.dry_run)
+        run([PY, "05_pack_webdataset.py", "--manifest", str(man), "--processed-dir", str(processed),
+             "--out", str(wds), "--overwrite"], log, a.dry_run)
+        try:
+            run([PY, "verify_dataset.py", "--root", str(wds), "--out-dir", str(debug), "--debug-videos", "2",
+                 "--num-shards", "50"], log, a.dry_run, stdout_path=debug / "verify.txt")
+        except StepFailed as e:  # keep going: the bundle is most useful exactly when something failed
+            log.warning("%s (see debug/verify.txt)", e)
+    except StepFailed as e:
+        failed = e
+        log.error("%s -- bundling what exists so far", e)
+    finally:
+        if not a.dry_run:
+            bundle_smoke(root, man, processed, wds, debug, log)
+    if failed:
+        raise failed
+
+
+def bundle_smoke(root: Path, man: Path, processed: Path, wds: Path, debug: Path, log) -> None:
+    """Always produce smoke_results.tgz: debug grids/videos, verify/inspect reports and every stage's log."""
+    debug.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run([PY, "inspect_clips.py", "--processed-dir", str(processed), "--manifest", str(man)],
+                       cwd=HERE, stdout=open(debug / "inspect.txt", "w"), stderr=subprocess.STDOUT, timeout=600)
+    except Exception as e:
+        log.warning("inspect_clips failed: %s", e)
+    if (wds / "name_mismatch_report.csv").exists():
+        shutil.copy(wds / "name_mismatch_report.csv", debug / "name_mismatch_report.csv")
+    logs_dst = debug / "logs"
+    logs_dst.mkdir(exist_ok=True)
+    for f in (DATA_ROOT / "logs").glob("*.log"):
+        try:  # last ~2000 lines of each stage log
+            lines = f.read_text(errors="replace").splitlines()[-2000:]
+            (logs_dst / f.name).write_text("\n".join(lines))
+        except OSError:
+            pass
+    bundle = root / "smoke_results.tgz"
+    try:
         subprocess.run(["tar", "czf", str(bundle), "-C", str(root), "debug"], check=True)
-        log.info("Smoke test done. Download %s (grids, debug videos, verify.txt, inspect.txt, name mismatches)", bundle)
+        log.info("Smoke bundle: %s  (download this)", bundle)
+    except Exception as e:
+        log.error("could not create %s: %s", bundle, e)
 
 
 # ============================================================================ bulk
@@ -114,7 +154,7 @@ def bulk(a, log):
     if a.resample:
         resample(a, log)
     if not a.skip_layout:
-        run([PY, "02c_detect_layout.py", "--workers", str(a.workers), *net_args(a)], log, a.dry_run)
+        run([PY, "02c_detect_layout.py", "--workers", str(a.workers), *layout_args(a), *net_args(a)], log, a.dry_run)
     cycle = 0
     while True:
         cycle += 1
@@ -150,6 +190,8 @@ def main():
     ap.add_argument("--min-free-gb", type=float, default=60.0)
     ap.add_argument("--min-video-gameplay-frac", type=float, default=0.5)
     ap.add_argument("--skip-layout", action="store_true", help="don't run 02c (already done)")
+    ap.add_argument("--layout-model", default=None,
+                    help="VLM for 02c, e.g. Qwen/Qwen2.5-VL-32B-Instruct-AWQ (better layouts than the 7B default)")
     ap.add_argument("--resample", action="store_true", help="re-run stage 02 first")
     ap.add_argument("--dry-run", action="store_true", help="print the commands without running them")
     a = ap.parse_args()
