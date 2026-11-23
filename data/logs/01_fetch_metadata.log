@@ -1,0 +1,56 @@
+2026-11-22 21:33:46 | INFO    | 01_fetch_metadata | Syncing 3 shard(s) from nvidia/NitroGen with 3 worker(s)
+2026-11-22 21:33:47 | INFO    | 01_fetch_metadata | Detected parquet schema (first shard):
+back: int32
+dpad_down: int32
+dpad_left: int32
+dpad_right: int32
+dpad_up: int32
+east: int32
+guide: int32
+left_shoulder: int32
+left_thumb: int32
+left_trigger: int32
+north: int32
+right_shoulder: int32
+right_thumb: int32
+right_trigger: int32
+south: int32
+start: int32
+west: int32
+j_left: list<element: double>
+  child 0, element: double
+j_right: list<element: double>
+  child 0, element: double
+2026-11-22 21:33:47 | INFO    | 01_fetch_metadata | Action layout -> {"j_left": {"mode": "list", "cols": ["j_left"]}, "j_right": {"mode": "list", "cols": ["j_right"]}}
+2026-11-22 21:33:47 | INFO    | 01_fetch_metadata | Example metadata.json:
+{
+  "uuid": "0kUiQdZxRlM_chunk_0021_actions",
+  "chunk_id": "0021",
+  "chunk_size": 1200,
+  "original_video": {
+    "resolution": [
+      1080,
+      1920
+    ],
+    "video_id": "0kUiQdZxRlM",
+    "start_time": 420,
+    "end_time": 440,
+    "duration": 20,
+    "start_frame": 25200,
+    "end_frame": 26399,
+    "source": "youtube",
+    "url": "https://www.youtube.com/watch?v=0kUiQdZxRlM"
+  },
+  "game": "other",
+  "controller_type": "xboxone",
+  "bbox_controller_overlay": [
+    1615,
+    833,
+    280,
+    236
+  ]
+}
+2026-11-22 21:33:47 | INFO    | 01_fetch_metadata | Output action vector (21-d): ['j_left_x', 'j_left_y', 'j_right_x', 'j_right_y', 'dpad_down', 'dpad_left', 'dpad_right', 'dpad_up', 'left_shoulder', 'left_thumb', 'left_trigger', 'right_shoulder', 'right_thumb', 'right_trigger', 'south', 'west', 'east', 'north', 'back', 'start', 'guide']
+2026-11-22 21:33:47 | INFO    | 01_fetch_metadata | SHARD_0087 ok: 613 chunks, errors=0, 1s
+2026-11-22 21:33:48 | INFO    | 01_fetch_metadata | SHARD_0042 ok: 1,177 chunks, errors=0, 2s
+2026-11-22 21:33:49 | INFO    | 01_fetch_metadata | SHARD_0000 ok: 2,071 chunks, errors=0, 2s

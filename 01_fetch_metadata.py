@@ -23,7 +23,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import shutil
+import subprocess
+import sys
 import tarfile
 import time
 import traceback
@@ -88,7 +92,8 @@ def build_rows(chunk_dir: str, shard: int, files: dict[str, bytes], schema_cache
     if src is None:
         return None, "no_actions"
     md = json.loads(files["metadata.json"])
-    table = pq.read_table(pa.BufferReader(files[f"actions_{src}.parquet"]))
+    # ParquetFile.read is ~2.5x cheaper than read_table for tiny files; no threads (we're already multi-process)
+    table = pq.ParquetFile(pa.BufferReader(files[f"actions_{src}.parquet"])).read(use_threads=False)
     if "schema" not in schema_cache:
         schema_cache["schema"] = detect_action_schema(
             table.column_names, {f.name: str(f.type) for f in table.schema})
@@ -129,6 +134,18 @@ def build_rows(chunk_dir: str, shard: int, files: dict[str, bytes], schema_cache
 
 
 # ----------------------------------------------------------------------------- per-shard
+def _worker_logger() -> logging.Logger:
+    """Stderr logger usable inside pool workers (handlers aren't inherited under spawn/forkserver)."""
+    lg = logging.getLogger("01_fetch_metadata.worker")
+    if not lg.handlers:
+        h = logging.StreamHandler(sys.stderr)
+        h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | worker | %(message)s", "%Y-%m-%d %H:%M:%S"))
+        lg.addHandler(h)
+        lg.setLevel(logging.INFO)
+        lg.propagate = False
+    return lg
+
+
 def process_shard(shard: int, args) -> dict:
     out = Path(args.out)
     name = f"SHARD_{shard:04d}"
@@ -186,6 +203,10 @@ def process_shard(shard: int, args) -> dict:
             buf_idx.append(rows[0])
             buf_act.append(rows[1])
             counts["chunks"] += 1
+            if counts["chunks"] % args.progress_every == 0:
+                el = time.time() - t_parse
+                wlog.info("%s: %s chunks parsed (%.0f s, %.0f chunks/s)", name, f"{counts['chunks']:,}", el,
+                          counts["chunks"] / max(el, 1e-6))
             counts["frames"] += rows[0]["n_frames"]
         pending.clear()
         if len(buf_idx) >= 2000:
@@ -199,8 +220,14 @@ def process_shard(shard: int, args) -> dict:
             buf_act.clear()
 
     loose_root = out / "loose" if args.extract_loose else None
+    wlog = _worker_logger()
+    wlog.info("%s: downloaded in %.0f s, parsing ...", name, t_dl)
+    t_parse = time.time()
+    # decompress in a separate process (pigz > gzip) so gzip and parquet parsing use different cores
+    gz = shutil.which("pigz") or shutil.which("gzip")
+    proc = subprocess.Popen([gz, "-dc", str(tar_path)], stdout=subprocess.PIPE, bufsize=1 << 20) if gz else None
     try:
-        with tarfile.open(tar_path, mode="r|gz") as tf:
+        with (tarfile.open(fileobj=proc.stdout, mode="r|") if proc else tarfile.open(tar_path, mode="r|gz")) as tf:
             for m in tf:
                 if not m.isfile():
                     continue
@@ -221,9 +248,14 @@ def process_shard(shard: int, args) -> dict:
                     p.write_bytes(data)
         flush_pending()
         write_buffers()
+        if proc is not None and proc.wait() != 0:
+            raise RuntimeError(f"{gz} failed on {tar_path} (exit {proc.returncode}) — corrupt download? delete it and re-run")
     finally:
         iw.close()
         aw.close()
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
     os.replace(idx_tmp, idx_path)
     os.replace(act_tmp, act_path)
 
@@ -283,8 +315,10 @@ def main():
     ap.add_argument("--revision", default="main")
     ap.add_argument("--out", default=str(DATA_ROOT / "nitrogen_meta"))
     ap.add_argument("--shards", default="all", help="'all' or e.g. '0-9,42'")
-    ap.add_argument("--workers", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)),
-                    help="shards processed in parallel (each ~2 GB peak disk for the tarball)")
+    ap.add_argument("--workers", type=int, default=max(1, min(16, (os.cpu_count() or 2) - 1)),
+                    help="shards processed in parallel; parsing is CPU-bound, so ~#cores-1 "
+                         "(each worker also needs ~2 GB scratch disk for its tarball)")
+    ap.add_argument("--progress-every", type=int, default=10000, help="log every N parsed chunks per shard")
     ap.add_argument("--retries", type=int, default=4)
     ap.add_argument("--keep-tar", action="store_true", help="keep downloaded tarballs")
     ap.add_argument("--extract-loose", action="store_true",
