@@ -512,7 +512,7 @@ game_groups:
   # Celeste custom maps / mods (community map packs streamed as their own "games")
   Celeste: ["Strawberry Jam", "Golden Grind", "Lunaris", "Solaris", "4Dark", "A7D", "Sapphire Dash", "Amoeba",
             "Calypta", "Shockbounce", "Ultra Summit", "Transient", "3L", "Zucchini", "Donker19", "Eevee's Buff Sides",
-            "Bingo Brawlers", "Doki Doki Literature Club"]
+            "Bingo Brawlers", "Doki Doki Literature Club", "Arphi's D-Sides", "Parrot Dash", "Carry the Glass"]
   "Skul: The Hero Slayer": ["SKULL: The Hero Slayer", "Skull"]
   Squidlit: ["Squid Game: The Challenge"]
   "The Binding of Isaac": ["The Binding of Isaac: Rebirth", "The Binding of Isaac: Repentance", "TBOIR+"]

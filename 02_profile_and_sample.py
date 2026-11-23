@@ -578,6 +578,10 @@ def main():
             else:
                 src = f"llm+{src}"
             key = lab.group_of.get(key, key)  # editions / series -> one game for the holdout
+            if key in lab.title_2d:  # show the canonical title (e.g. Celeste, not one of its mod packs)
+                name = lab.title_2d[key][0]
+            elif key in lab.title_3d:
+                name = lab.title_3d[key]
             upd[v] = (status, genre, src, key, name)
         if upd:
             u = pd.DataFrame.from_dict(upd, orient="index", columns=["status", "genre", "label_source", "game_key", "game_name"])

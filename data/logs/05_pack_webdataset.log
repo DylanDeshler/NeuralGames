@@ -1,4 +1,0 @@
-2026-11-22 21:51:40 | INFO    | 05_pack_webdataset | [train] 8 samples, 0.0 h, 4 shards -> /tmp/ng_test/wds/train | dropped {'not_processed': 497, 'no_caption': 0, 'vlm_3d': 0, 'dark': 0, 'bad_shape': 0}
-2026-11-22 21:51:40 | INFO    | 05_pack_webdataset | [val_unseen_games] 3 samples, 0.0 h, 2 shards -> /tmp/ng_test/wds/val_unseen_games | dropped {'not_processed': 32, 'no_caption': 0, 'vlm_3d': 0, 'dark': 0, 'bad_shape': 0}
-2026-11-22 22:01:35 | INFO    | 05_pack_webdataset | [train] 8 samples, 0.0 h | buckets: {'19x14': '304x224 0.0h', '21x12': '336x192 0.0h'} | dropped {'not_processed': 497, 'no_caption': 0, 'vlm_3d': 0, 'dark': 0, 'bad_shape': 0}
-2026-11-22 22:01:35 | INFO    | 05_pack_webdataset | [val_unseen_games] 2 samples, 0.0 h | buckets: {'19x14': '304x224 0.0h', '21x12': '336x192 0.0h'} | dropped {'not_processed': 33, 'no_caption': 0, 'vlm_3d': 0, 'dark': 0, 'bad_shape': 0}
