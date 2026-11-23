@@ -67,6 +67,14 @@ class _NullLogger:
     warning = info = error = debug
 
 
+class _nullcontext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 class PermanentError(Exception):
     pass
 
@@ -107,6 +115,7 @@ class StreamResolver:
         self.glock = threading.Lock()
         self.dead: dict[str, str] = {}
         self.bot_streak = 0  # consecutive bot-check / 429 failures across all workers
+        self.geo_locks: dict[str, threading.Lock] = {}
         self.proxy_streak = 0  # consecutive "cannot connect to proxy" failures
 
     def ydl_opts(self, fmt: str) -> dict:
@@ -149,6 +158,10 @@ class StreamResolver:
                    "format_id": f.get("format_id"), "vcodec": f.get("vcodec"), "title": info.get("title")}
             self.cache[key] = (time.time(), res)
             return res
+
+    def geo_lock(self, video_id: str) -> threading.Lock:
+        with self.glock:
+            return self.geo_locks.setdefault(video_id, threading.Lock())
 
     def invalidate(self, video_id: str):
         for k in [k for k in self.cache if k[0] == video_id]:
@@ -284,14 +297,15 @@ def static_bottom_band(frames: list[np.ndarray], borders, min_frac: float = 0.02
     return n if band - above >= 0.10 else 0  # bar must be clearly more static than the game just above it
 
 
-def choose_bucket(cw: int, ch: int, buckets: list[tuple[int, int]], patch: int, max_crop: float) -> dict:
+def choose_bucket(cw: int, ch: int, buckets: list[tuple[int, int]], patch: int, max_crop: float,
+                  force: tuple[int, int] | None = None) -> dict:
     """Pick the bucket with the least aspect mismatch (ties -> more tokens).
 
     cover: scale to cover the bucket and centre-crop the (<= max_crop) excess, so there's no distortion and no bars
     fit:   if no bucket is within max_crop, scale to fit and pad (black bars, recorded as pad/content_wh)
     """
     a = cw / ch
-    best = min(buckets, key=lambda b: (1 - min(a / (b[0] / b[1]), (b[0] / b[1]) / a), -b[0] * b[1]))
+    best = force or min(buckets, key=lambda b: (1 - min(a / (b[0] / b[1]), (b[0] / b[1]) / a), -b[0] * b[1]))
     W, H = best[0] * patch, best[1] * patch
     t = W / H
     crop = 1 - min(a / t, t / a)
@@ -367,11 +381,19 @@ def warp(frame: np.ndarray, borders, geo) -> np.ndarray:
 
 # ============================================================================ core processing
 def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], fps_out: float, n_out: int,
-                          out_mp4: Path, frame0_png: Path, args, tmp: Path) -> tuple[int, dict]:
+                          out_mp4: Path, frame0_png: Path, args, tmp: Path, lock: dict | None = None) -> tuple[int, dict]:
     """ffmpeg decode (crop game area, analysis-res) -> buffer -> detect bars -> choose bucket ->
-    resize/crop + inpaint in python -> ffmpeg encode. Returns (decoded_frames, geometry)."""
+    resize/crop + inpaint in python -> ffmpeg encode. Returns (decoded_frames, geometry).
+
+    `lock` (per-video geometry from an earlier chunk): reuse its content rectangle and bucket instead of
+    re-detecting, so every chunk of a video is framed identically."""
     src_w, src_h = src_wh
-    crop_src = source_crop(row, src_w, src_h)
+    if lock:
+        rx, ry, rw, rh = lock["content_rel"]
+        x0, y0 = int(round(rx * src_w)), int(round(ry * src_h))
+        crop_src = (x0, y0, max(16, int(round(rw * src_w)) // 2 * 2), max(16, int(round(rh * src_h)) // 2 * 2))
+    else:
+        crop_src = source_crop(row, src_w, src_h)
     x0, y0, cw, ch = crop_src
     aw, ah = analysis_dims(cw, ch, args.analysis_max_dim)
     dec_cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *input_args, "-an", "-sn",
@@ -395,13 +417,18 @@ def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], f
         raise ShortClipError(f"only {decoded}/{n_out} frames decoded: {(tmp / 'dec.log').read_text()[-400:]}")
     frames += [frames[-1]] * (n_out - decoded)  # tiny tail deficit (rounding at clip end): repeat last frame
 
-    borders = detect_borders(frames, args.border_thresh) if args.detect_borders else (0, 0, 0, 0)
-    if args.trim_static_bars and bool(getattr(row, "stream_layout", False)):
+    borders = detect_borders(frames, args.border_thresh) if (args.detect_borders and not lock) else (0, 0, 0, 0)
+    if not lock and args.trim_static_bars and bool(getattr(row, "stream_layout", False)):
         band = static_bottom_band(frames, borders)
         if band:
             borders = (borders[0], borders[1], borders[2], borders[3] + band)  # trimmed like a bottom bar
     L, T, R, B = borders
-    geo = choose_bucket(aw - L - R, ah - T - B, args.bucket_list, args.patch, args.max_crop)
+    force = tuple(int(v) for v in lock["bucket"].split("x")) if (lock and lock.get("bucket")) else None
+    geo = choose_bucket(aw - L - R, ah - T - B, args.bucket_list, args.patch, args.max_crop, force=force)
+    # final content rectangle in source-relative coords (what a per-video geometry lock stores)
+    geo["content_rel"] = [(x0 + L * cw / aw) / src_w, (y0 + T * ch / ah) / src_h,
+                          (aw - L - R) * cw / aw / src_w, (ah - T - B) * ch / ah / src_h]
+    geo["geometry_locked"] = bool(lock)
     mask, boxes = build_mask(overlay_boxes_src(row, src_w, src_h, args.mask_others), crop_src, (aw, ah),
                              borders, geo, args.mask_dilate)
     W, H = geo["W"], geo["H"]
@@ -520,8 +547,21 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
                     info = {"width": w, "height": h, "format_id": "sections"}
                     src_wh = (w, h)
                     inp = ["-i", str(raw)]
-                decoded, geo = decode_process_encode(inp, row, src_wh, fps_out, n_out, work / "frames.mp4",
-                                                     work / "frame0.png", args, tmp)
+                gpath = Path(args.processed_dir) / row.video_id / "_geometry.json"
+                c_rel = getattr(row, "content_rel", None)
+                if isinstance(c_rel, str) and c_rel:  # 02c decided this video's framing from several probes
+                    preset = {"content_rel": json.loads(c_rel), "bucket": None, "source": "02c"}
+                else:
+                    preset = None
+                need_lock = preset is None and args.lock_geometry and not gpath.exists()
+                with (resolver.geo_lock(row.video_id) if need_lock else _nullcontext()):  # fallback: first chunk decides
+                    lock = preset or (json.loads(gpath.read_text()) if (args.lock_geometry and gpath.exists()) else None)
+                    decoded, geo = decode_process_encode(inp, row, src_wh, fps_out, n_out, work / "frames.mp4",
+                                                         work / "frame0.png", args, tmp, lock=lock)
+                    if preset is None and args.lock_geometry and lock is None and geo.get("frac_black", 1.0) < 0.3:
+                        gpath.parent.mkdir(parents=True, exist_ok=True)  # don't let a fade/black chunk set the framing
+                        atomic_write_json(gpath, {"content_rel": geo["content_rel"], "bucket": geo["bucket"],
+                                                  "from_uuid": row.uuid, "src_wh": list(src_wh)})
                 method_used = method
                 break
             except PermanentError:
@@ -552,6 +592,9 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
             "start_time": start, "duration": dur, "action_names": ACTION_NAMES, "action_source": row.action_source,
             "width": geo["W"], "height": geo["H"], "bucket": geo["bucket"], "patch": args.patch,
             "fit_mode": geo["mode"], "aspect_crop_frac": geo["crop_frac"], "pad": geo["pad"],
+            "geometry_locked": geo.get("geometry_locked", False), "content_rel": geo.get("content_rel"),
+            "geometry_source": ("02c" if isinstance(getattr(row, "content_rel", None), str) and row.content_rel else
+                                "lock" if geo.get("geometry_locked") else "per_chunk"),
             "content_wh": geo["content_wh"], "crop_src": geo["crop_src"], "src_wh": geo["src_wh"],
             "analysis_wh": geo["analysis_wh"], "border_crop_ltrb": geo["borders"],
             "inpaint_boxes": geo["inpaint_boxes"], "inpaint_frac": geo["inpaint_frac"], "decoded_frames": int(decoded),
@@ -654,6 +697,8 @@ def apply_layout_overrides(man: pd.DataFrame, args, log) -> pd.DataFrame:
     man["bbox_game_area"] = new_ga
     fill = pd.Series(changed, index=man.index)
     man["layout_override"] = fill
+    # per-video final content rectangle from 02c's multi-probe consensus (preferred over per-chunk detection)
+    man["content_rel"] = vid.map(ok["content_rel"]) if "content_rel" in ok else None
     man["stream_layout"] = vid.map(ok["stream_layout"]).fillna(False).astype(bool) if "stream_layout" in ok else False
     if suspicious:
         log.warning("Layout: %d chunks where the 02c box barely overlaps the metadata box -> kept metadata", suspicious)
@@ -730,6 +775,8 @@ def main():
                          "list 'WxH,...' in patches, e.g. '21x12,19x14,16x16'")
     ap.add_argument("--max-crop", type=float, default=0.05,
                     help="max fraction of the content cropped to fill a bucket; beyond this, pad instead")
+    ap.add_argument("--lock-geometry", action=argparse.BooleanOptionalAction, default=True,
+                    help="decide crop + bucket once per video (first good chunk) and reuse it for all its chunks")
     ap.add_argument("--trim-static-bars", action=argparse.BooleanOptionalAction, default=True,
                     help="for videos 02c flagged as stream layouts, trim a bottom strip that stays static all clip "
                          "(stream status bars the VLM missed)")

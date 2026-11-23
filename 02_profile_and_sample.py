@@ -200,11 +200,33 @@ def aspect_report(d2: pd.DataFrame, meta_dir: Path, reports: Path) -> None:
             columns=["uuid", "bbox_game_area"], filter=pc.field("uuid").isin(sdf["uuid"].tolist()))
         parts.append(t.to_pandas())
     ga = pd.concat(parts).drop_duplicates("uuid").set_index("uuid")["bbox_game_area"]
-    x = d2[["uuid", "res_w", "res_h", "duration"]].copy()
+    x = d2[["uuid", "video_id", "res_w", "res_h", "duration"]].copy()
     g = x["uuid"].map(ga).map(lambda v: json.loads(v) if isinstance(v, str) else None)
+    lo_path = DATA_ROOT / "layout_overrides.parquet"  # after 02c: crop = metadata area ∩ detected area
+    n_lo = 0
+    if lo_path.exists():
+        lo = pd.read_parquet(lo_path)
+        lo = lo[lo["status"] == "ok"].set_index("video_id")["game_area"].dropna().map(json.loads)
+        full = {"xtl": 0.0, "ytl": 0.0, "xbr": 1.0, "ybr": 1.0}
+
+        def inter(a, b):
+            return {"xtl": max(a["xtl"], b["xtl"]), "ytl": max(a["ytl"], b["ytl"]),
+                    "xbr": min(a["xbr"], b["xbr"]), "ybr": min(a["ybr"], b["ybr"])}
+        det = x["video_id"].map(lo)
+        has = det.notna()
+        n_lo = int(has.sum())
+        g = pd.Series([inter(gg if isinstance(gg, dict) else full, dd) if isinstance(dd, dict) else gg
+                       for gg, dd in zip(g, det)], index=g.index)
     fw = g.map(lambda d: (d["xbr"] - d["xtl"]) if isinstance(d, dict) else 1.0)
     fh = g.map(lambda d: (d["ybr"] - d["ytl"]) if isinstance(d, dict) else 1.0)
     x["aspect"] = (x["res_w"] * fw) / (x["res_h"] * fh).replace(0, np.nan)
+    if lo_path.exists():  # 02c's final per-video rectangle (incl. pixel trims) is the most exact
+        lo2 = pd.read_parquet(lo_path)
+        if "content_rel" in lo2:
+            cr = lo2[lo2["status"] == "ok"].set_index("video_id")["content_rel"].dropna().map(json.loads)
+            m_ = x["video_id"].isin(cr.index)
+            rel = x.loc[m_, "video_id"].map(cr)
+            x.loc[m_, "aspect"] = [(r[2] * w) / max(r[3] * h, 1e-6) for r, w, h in zip(rel, x.loc[m_, "res_w"], x.loc[m_, "res_h"])]
     x["has_game_area"] = g.map(lambda d: isinstance(d, dict))
 
     def name(a):
@@ -219,7 +241,8 @@ def aspect_report(d2: pd.DataFrame, meta_dir: Path, reports: Path) -> None:
     t["share"] = t["hours"] / t["hours"].sum()
     t = t.sort_values("hours", ascending=False)
     t.to_csv(reports / "aspect_distribution.csv")
-    print("\n Content aspect ratio of the 2D pool (metadata; stage 03 also detects hidden pillarboxing):")
+    src = f"metadata ∩ 02c layout boxes for {n_lo:,} chunks" if n_lo else "metadata only; run 02c for post-crop ratios"
+    print(f"\n Content aspect ratio of the 2D pool ({src}; stage 03 also trims hidden bars):")
     for k, r in t.iterrows():
         print(f"   {k:<14} {r.hours:>9.1f} h  {r.share:>6.1%}   (bbox_game_area on {r.with_game_area:.0%})")
 
@@ -493,7 +516,12 @@ def main():
                     vid_update[v] = ("unavailable", "", "youtube", None, None)
                 continue
             text = " | ".join([m.get("title") or "", " ".join(m.get("tags") or [])])
-            hit = lab.match_text(text) or lab.match_text((m.get("description") or "")[:300])
+            # the TITLE is strong evidence; tags/description are weak (streamers stuff tags with popular game
+            # names: e.g. Celeste-mod streams tagged "super mario bros"), so LLM labels may override those
+            hit, src = lab.match_text(m.get("title") or ""), "youtube_title"
+            if not hit:
+                hit = lab.match_text(" ".join(m.get("tags") or [])) or lab.match_text((m.get("description") or "")[:300])
+                src = "youtube_tags"
             slug = slug_of_vid[v]
             if slug != "other":  # named but unlisted slug: per-video hits win, the rest may be labeled by vote
                 if hit:
@@ -506,9 +534,9 @@ def main():
                 status, key, _ = hit
                 if status == "2d":
                     disp, genre = lab.title_2d[key]
-                    vid_update[v] = ("2d", genre, "youtube_title", key, disp)
+                    vid_update[v] = ("2d", genre, src, key, disp)
                 else:
-                    vid_update[v] = ("3d", "", "youtube_title", key, lab.title_3d[key])
+                    vid_update[v] = ("3d", "", src, key, lab.title_3d[key])
             elif args.keyword_fallback and lab.keyword_vote(text + " " + (m.get("description") or "")) > 0:
                 vid_update[v] = ("2d", "2D (keyword)", "youtube_keywords", f"unk:{v}", f"unk:{v}")
         n_multi = 0
@@ -550,7 +578,7 @@ def main():
         if not args.llm_allow_multi:
             L = L[~L["llm_multiple_games"].astype(bool)]
         # apply where we have no label yet, or only weak evidence (keyword / slug vote)
-        weak = (df["status"] == "unknown") | df["label_source"].isin(["youtube_keywords", "youtube_vote"])
+        weak = (df["status"] == "unknown") | df["label_source"].isin(["youtube_keywords", "youtube_vote", "youtube_tags"])
         cand = set(df.loc[weak, "video_id"].unique()) & set(L.index)
         # perspective per game: game-level LLM answer (02b second pass) > majority of video-level answers
         gp_path = llm_path.with_name("llm_game_perspectives.parquet")

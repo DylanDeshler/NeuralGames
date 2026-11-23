@@ -105,6 +105,7 @@ def _box(b, w: int, h: int):
     return [x1 / w, y1 / h, x2 / w, y2 / h]  # relative
 
 
+BUCKETS: list = []
 NORMALIZED = True  # prompts request 0-1000 coordinates (set False for models that only speak pixels)
 PANEL_TYPES = {"chat", "status_bar", "border", "background", "alert", "other", "logo"}
 OVERLAY_TYPES = {"webcam", "input_display", "logo", "alert"}
@@ -216,12 +217,28 @@ def combine(game: dict | None, elements: list | None, screen: str = "") -> dict 
 
 
 # ============================================================================ frame grabbing
-def grab_frames(vid: str, url: str, times: list[float], tmp: Path, args, resolver, limiter) -> tuple[list[Image.Image], str]:
-    """Single frames at `times`. Direct stream URL with hard network timeouts; if that fails, yt-dlp
-    section downloads (tried once per video, not per frame). Returns (frames, method)."""
-    frames: list[Image.Image] = []
+def _decode_raw(input_args: list[str], src_wh: tuple[int, int], seconds: float, args) -> np.ndarray | None:
+    """Decode `seconds` of video at 15 fps, long side --probe-size, to an (T, h, w, 3) uint8 array."""
+    sw, sh = src_wh
+    s_ = args.probe_size / max(sw, sh)
+    w, h = max(2, int(round(sw * s_ / 2)) * 2), max(2, int(round(sh * s_ / 2)) * 2)
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *input_args, "-an", "-sn",
+           "-vf", f"fps=15,scale={w}:{h}:flags=area,format=rgb24", "-frames:v", str(int(seconds * 15)),
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, timeout=args.net_timeout * 3).stdout
+    except subprocess.TimeoutExpired:
+        return None
+    n = len(raw) // (w * h * 3)
+    return np.frombuffer(raw[: n * w * h * 3], np.uint8).reshape(n, h, w, 3) if n >= 5 else None
+
+
+def grab_probes(vid: str, url: str, times: list[float], tmp: Path, args, resolver, limiter) -> tuple[list[np.ndarray], str]:
+    """Short probe clips (--probe-seconds at 15 fps) at `times`: the VLM looks at each probe's middle frame,
+    the pixel checks (black bars, static status bar) use all of its frames. Direct stream URL with hard network
+    timeouts; yt-dlp sections as a fallback (switched to once per video). Returns (probes, method)."""
+    probes: list[np.ndarray] = []
     fmt = S3.format_selector(15.0, args.max_src_height)
-    info = None
     try:
         info = resolver.resolve(vid, url, fmt, args.max_src_height, limiter)
     except S3.PermanentError:
@@ -229,39 +246,64 @@ def grab_frames(vid: str, url: str, times: list[float], tmp: Path, args, resolve
     except Exception:
         info = None
     method = "direct"
-    use_direct = bool(info and info.get("url"))
-    for i, t in enumerate(times):
-        out = tmp / f"f{i}.png"
-        ok = False
+    use_direct = bool(info and info.get("url") and info.get("width") and info.get("height"))
+    for t in times:
+        arr = None
         if use_direct:
             hdr = "".join(f"{k}: {v}\r\n" for k, v in (info.get("headers") or {}).items())
-            cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                   "-rw_timeout", str(int(args.net_timeout * 1e6)),
-                   *(["-headers", hdr] if hdr else []),
+            inp = ["-rw_timeout", str(int(args.net_timeout * 1e6)), *(["-headers", hdr] if hdr else []),
                    *(["-http_proxy", args.proxy] if args.proxy and args.proxy.startswith("http") else []),
-                   "-ss", f"{t:.2f}", "-i", info["url"], "-frames:v", "1", str(out)]
-            try:
-                ok = subprocess.run(cmd, capture_output=True, timeout=args.net_timeout * 2).returncode == 0 and out.exists()
-            except subprocess.TimeoutExpired:
-                ok = False
-            if not ok:
-                use_direct = False  # don't keep hammering a URL that failed; switch this video to sections
-        if not ok:
+                   "-ss", f"{t:.2f}", "-t", f"{args.probe_seconds + 0.5:.2f}", "-i", info["url"]]
+            arr = _decode_raw(inp, (info["width"], info["height"]), args.probe_seconds, args)
+            if arr is None:
+                use_direct = False
+        if arr is None:
             method = "sections"
             try:
-                raw = S3.download_section(url, fmt, t, t + 1.5, tmp, args)
-                ok = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(raw),
-                                     "-frames:v", "1", str(out)], capture_output=True, timeout=30).returncode == 0
+                raw = S3.download_section(url, fmt, t, t + args.probe_seconds + 0.5, tmp, args)
+                arr = _decode_raw(["-i", str(raw)], S3.probe_dims(raw), args.probe_seconds, args)
                 raw.unlink(missing_ok=True)
             except S3.PermanentError:
                 raise
             except Exception:
-                ok = False
-            if not ok:
-                break  # both paths failed for this video: give up on it instead of retrying every frame
-        if ok and out.exists():
-            frames.append(Image.open(out).convert("RGB"))
-    return frames, method
+                arr = None
+            if arr is None:
+                break
+        probes.append(arr)
+    return probes, method
+
+
+def video_metadata_area(g: pd.DataFrame) -> dict | None:
+    """Most common NitroGen bbox_game_area of a video's chunks (None = full frame)."""
+    vals = [s_ for s_ in g["bbox_game_area"] if isinstance(S3._jload(s_), dict)]
+    return S3._jload(pd.Series(vals).mode().iat[0]) if vals else None
+
+
+def pixel_trims(probes: list[np.ndarray], game_rel: list[float], stream: bool) -> dict:
+    """Black-bar / static-status-bar trims inside the game box, decided by CONSENSUS over the probes
+    (bars: median per side; bottom status bar: must be found in at least half the probes)."""
+    x0, y0, x1, y1 = game_rel
+    sides, bands, used = [], [], 0
+    for arr in probes:
+        h, w = arr.shape[1:3]
+        sub = arr[:, int(round(y0 * h)):max(int(round(y0 * h)) + 2, int(round(y1 * h))),
+                  int(round(x0 * w)):max(int(round(x0 * w)) + 2, int(round(x1 * w)))]
+        if sub.mean() < 8:  # mostly black probe (fade / loading): no evidence
+            continue
+        used += 1
+        frames = list(sub)
+        sh, sw = sub.shape[1:3]
+        L, T, R, B = S3.detect_borders(frames, 24.0)
+        sides.append((L / sw, T / sh, R / sw, B / sh))
+        band = S3.static_bottom_band(frames, (L, T, R, B)) if stream else 0
+        bands.append(band / sh)
+    if not used:
+        return {"l": 0.0, "t": 0.0, "r": 0.0, "b": 0.0, "band": 0.0, "probes_used": 0}
+    med = np.median(np.array(sides), axis=0)
+    pos = [b for b in bands if b > 0]
+    band = float(np.median(pos)) if len(pos) >= max(1, int(np.ceil(used / 2))) else 0.0
+    return {"l": float(med[0]), "t": float(med[1]), "r": float(med[2]), "b": float(med[3]), "band": band,
+            "band_votes": f"{len(pos)}/{used}", "probes_used": used}
 
 
 def aggregate(results: list[dict], full_thresh: float) -> dict:
@@ -329,7 +371,7 @@ def main():
     ap.add_argument("--scope", choices=["missing", "all"], default="all",
                     help="'all' (default): NitroGen's own game areas often still include stream bars, so check every "
                          "video; 'missing' = only videos without bbox_game_area")
-    ap.add_argument("--frames-per-video", type=int, default=3)
+    ap.add_argument("--frames-per-video", type=int, default=3, help="probe clips per video (spread over its chunks)")
     ap.add_argument("--full-thresh", type=float, default=0.97, help="box edges beyond this => full frame, no crop")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=8)
@@ -347,6 +389,9 @@ def main():
     ap.add_argument("--url-ttl", type=float, default=3 * 3600)
     ap.add_argument("--download-timeout", type=float, default=60)
     ap.add_argument("--net-timeout", type=float, default=20, help="seconds without network progress before a fetch fails")
+    ap.add_argument("--probe-seconds", type=float, default=4.0, help="length of each probe clip (pixel checks)")
+    ap.add_argument("--probe-size", type=int, default=576, help="probe decode size (long side)")
+    ap.add_argument("--patch", type=int, default=16, help="only for the predicted-bucket report")
     ap.add_argument("--max-src-height", type=int, default=480, help="probe-frame resolution (layout needs little detail)")
     args = ap.parse_args()
 
@@ -378,6 +423,8 @@ def main():
     global NORMALIZED
     NORMALIZED = calibrate_coords(llm, sp, chat_kw, log)
     resolver, limiter = S3.StreamResolver(args, log), S3.RateLimiter(args.max_starts_per_min)
+    global BUCKETS
+    BUCKETS = S3.auto_buckets(S3.CANONICAL_BUCKETS, 0.05)  # only for the predicted-bucket report; 03 decides
     shutil.rmtree(args.tmp_dir, ignore_errors=True)
     rows = []
 
@@ -390,7 +437,7 @@ def main():
         tmp.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
         try:
-            frames, method = grab_frames(v, url, times, tmp, args, resolver, limiter)
+            frames, method = grab_probes(v, url, times, tmp, args, resolver, limiter)
             return v, frames, None, method, time.time() - t0
         except S3.PermanentError as e:
             return v, [], f"permanent: {str(e)[:100]}", "-", time.time() - t0
@@ -412,7 +459,8 @@ def main():
             if not frames:
                 rows.append({"video_id": v, "status": err or "no_frames"})
                 continue
-            for fi, f in enumerate(frames):
+            for fi, arr in enumerate(frames):
+                f = Image.fromarray(arr[len(arr) // 2])
                 w, h = fit28(*f.size)
                 uri = to_data_uri(f.resize((w, h), Image.Resampling.BICUBIC))
                 for kind, prompt in (("game", PROMPT_GAME), ("layout", PROMPT_LAYOUT), ("screen", PROMPT_SCREEN)):
@@ -434,9 +482,32 @@ def main():
         for v, frames, err, method, secs in got:
             if frames:
                 res = per_vid.get(v, [])
-                rows.append({"video_id": v, "status": "ok" if res else "unparsed", "fetch_method": method,
-                             "fetch_s": round(secs, 1), **(aggregate(res, args.full_thresh) if res else {})})
+                row = {"video_id": v, "status": "ok" if res else "unparsed", "fetch_method": method,
+                       "fetch_s": round(secs, 1), **(aggregate(res, args.full_thresh) if res else {})}
+                if res:
+                    row.update(final_geometry(row, frames, vids[vids.video_id == v]))
+                rows.append(row)
         flush()
+
+    def final_geometry(row: dict, probes: list[np.ndarray], g: pd.DataFrame) -> dict:
+        """Per-video content rectangle = (metadata area ∩ VLM game box) minus consensus pixel trims."""
+        det = json.loads(row["game_area"]) if isinstance(row.get("game_area"), str) else None
+        meta = video_metadata_area(g)
+        full = {"xtl": 0.0, "ytl": 0.0, "xbr": 1.0, "ybr": 1.0}
+        a_, b_ = meta or full, det or full
+        box = [max(a_["xtl"], b_["xtl"]), max(a_["ytl"], b_["ytl"]), min(a_["xbr"], b_["xbr"]), min(a_["ybr"], b_["ybr"])]
+        if (box[2] - box[0]) * (box[3] - box[1]) < 0.3 * (a_["xbr"] - a_["xtl"]) * (a_["ybr"] - a_["ytl"]):
+            box = [a_["xtl"], a_["ytl"], a_["xbr"], a_["ybr"]]  # barely overlapping boxes: trust metadata
+        tr = pixel_trims(probes, box, bool(row.get("stream_layout")))
+        gw, gh = box[2] - box[0], box[3] - box[1]
+        x = box[0] + tr["l"] * gw
+        y = box[1] + tr["t"] * gh
+        w = gw * max(0.2, 1 - tr["l"] - tr["r"])
+        h = gh * max(0.2, 1 - tr["t"] - tr["b"] - tr["band"])
+        sh, sw = probes[0].shape[1:3]
+        bucket = S3.choose_bucket(w * sw, h * sh, BUCKETS, args.patch, 0.05)["bucket"]
+        return {"content_rel": json.dumps([x, y, w, h]), "pred_bucket": bucket, "trims": json.dumps(tr),
+                "content_aspect": round(w * sw / max(h * sh, 1e-6), 4)}
 
     stats = {"ok": 0, "fail": 0, "direct": 0, "sections": 0, "secs": 0.0}
     ready = []
