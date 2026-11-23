@@ -114,7 +114,8 @@ class VLLMText:
     def __init__(self, args):
         from vllm import LLM, SamplingParams
         self.llm = LLM(model=args.model, tensor_parallel_size=args.tensor_parallel_size, dtype="bfloat16",
-                       max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_mem, seed=0)
+                       max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_mem, seed=0,
+                       enforce_eager=args.enforce_eager)
         self.sp = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens)
         # Qwen3-style models: disable thinking for short structured answers
         self.kw = {"chat_template_kwargs": {"enable_thinking": False}} if "qwen3" in args.model.lower() else {}
@@ -161,7 +162,10 @@ def main():
                     help="any instruct LLM; bigger models know more obscure games")
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--max-new-tokens", type=int, default=160)
-    ap.add_argument("--max-model-len", type=int, default=4096)
+    ap.add_argument("--max-model-len", type=int, default=2048, help="prompts are ~700 tokens")
+    ap.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True,
+                    help="skip torch.compile + CUDA graphs (robust startup; small speed cost for this short job). "
+                         "--no-enforce-eager for max throughput once your vLLM install is known-good")
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
     ap.add_argument("--gpu-mem", type=float, default=0.90)
     ap.add_argument("--api-base", default="http://localhost:8000/v1")

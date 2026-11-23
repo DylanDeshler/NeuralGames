@@ -107,7 +107,7 @@ class VLLMBackend:
         self.llm = LLM(model=args.model, max_model_len=args.max_model_len, limit_mm_per_prompt={"image": 1},
                        tensor_parallel_size=args.tensor_parallel_size, gpu_memory_utilization=args.gpu_mem,
                        mm_processor_kwargs={"min_pixels": 64 * 28 * 28, "max_pixels": args.max_pixels},
-                       dtype="bfloat16", seed=0)
+                       dtype="bfloat16", seed=0, enforce_eager=args.enforce_eager)
         self.sp = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens)
 
     def __call__(self, images: list[Image.Image]) -> list[str]:
@@ -206,6 +206,8 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=160)
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
+    ap.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=False,
+                    help="skip torch.compile + CUDA graphs (use if vLLM engine startup fails)")
     ap.add_argument("--gpu-mem", type=float, default=0.90)
     ap.add_argument("--api-base", default="http://localhost:8000/v1")
     ap.add_argument("--api-key", default=None)
