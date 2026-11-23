@@ -215,7 +215,9 @@ python 02c_detect_layout.py --proxy http://127.0.0.1:8899 --limit 50   # check t
 python 03_download_and_process.py --proxy http://127.0.0.1:8899 --require-layout-check ...
 ```
 `--require-layout-check` makes stage 03 skip videos 02c hasn't checked yet, so no chat or webcam layouts
-slip in. `--min-video-gameplay-frac 0.5` additionally skips videos whose probe frames were mostly menus.
+slip in. `--min-video-gameplay-frac 0.5` additionally skips videos whose probe frames were mostly menus, and
+`--max-video-3d-frac 0.5` (default) skips videos whose probe frames 02c judged 3D (e.g. a mislabelled stream).
+Stage 05 also drops individual clips that stage 04 judged 3D (`--drop-vlm-3d`, on by default). 2.5D counts as 2D.
 
 ### 3. Download + process clips
 ```bash
@@ -304,7 +306,7 @@ and it can run while stage 03 is still downloading.
 
 ### 5. Pack + verify
 ```bash
-python 05_pack_webdataset.py --drop-vlm-3d          # ~1 GB shards in data/webdataset/{train,val_unseen_games}
+python 05_pack_webdataset.py                        # ~1 GB shards in data/webdataset/{train,val_unseen_games}
 python verify_dataset.py --num-shards 3 --debug-videos 2
 ```
 Stage 05 also drops clips with `vlm_frac_gameplay < --min-gameplay-frac` (0.75), clips with more than

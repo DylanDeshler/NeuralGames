@@ -723,6 +723,10 @@ def apply_layout_overrides(man: pd.DataFrame, args, log) -> pd.DataFrame:
         keep &= vid.isin(lo.set_index("video_id").index)
     if args.min_video_gameplay_frac > 0:
         keep &= ~vid.map(ok["frac_gameplay"]).fillna(1.0).lt(args.min_video_gameplay_frac)
+    if args.max_video_3d_frac < 1 and "frac_3d" in ok.columns:  # older 02c rows have no answer: kept, 05 filters per clip
+        n3d = vid.map(ok["frac_3d"]).gt(args.max_video_3d_frac)
+        keep &= ~n3d
+        log.info("02c judged %d videos 3D (%s chunks skipped)", vid[n3d].nunique(), f"{n3d.sum():,}")
     log.info("Layout overrides: game area filled for %s chunks (%d videos), overlays added for %s chunks; "
              "%s chunks skipped by layout filters", f"{fill.sum():,}", vid[fill].nunique(), f"{with_ov.sum():,}",
              f"{(~keep).sum():,}")
@@ -833,6 +837,8 @@ def main():
                     help="per-video game areas / overlay boxes from 02c_detect_layout.py (used if the file exists)")
     ap.add_argument("--require-layout-check", action="store_true",
                     help="skip videos without bbox_game_area that 02c hasn't checked yet (avoids encoding stream layouts)")
+    ap.add_argument("--max-video-3d-frac", type=float, default=0.5,
+                    help="skip videos where more than this share of 02c's probe frames looked 3D (1 = off)")
     ap.add_argument("--min-video-gameplay-frac", type=float, default=0.0,
                     help="skip videos where 02c saw gameplay in fewer than this fraction of its probe frames")
     args = ap.parse_args()

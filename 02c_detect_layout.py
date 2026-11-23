@@ -60,8 +60,11 @@ PROMPT_LAYOUT = ("Locate every livestream or recording element in this image tha
                  "game's own HUD (health bars, score, lives, minimap). Output bbox coordinates in JSON format, with the label "
                  "set to one of: chat, webcam, status_bar, border, background, alert, input_display. Output [] if there are none.")
 
-PROMPT_SCREEN = ("What is shown in this frame of a gameplay video? Answer with exactly one word from: gameplay, menu, title, "
-                 "loading, cutscene, map_or_inventory, black, not_a_game.")
+PROMPT_SCREEN = ("What is shown in this frame of a gameplay video? Answer with exactly two words. First word, one of: gameplay, "
+                 "menu, title, loading, cutscene, map_or_inventory, black, not_a_game. Second word, the game's view: 2d if "
+                 "the player moves on a flat plane seen from a fixed side, overhead or isometric camera (side-scrollers, "
+                 "top-down, fighting games, and 2.5D games drawn with 3D models but played on a 2D plane), 3d if the player "
+                 "moves freely in depth with a camera behind or around them, none if no game world is visible.")
 SCREENS = ["gameplay", "menu", "title", "loading", "cutscene", "map_or_inventory", "black", "not_a_game"]
 
 
@@ -169,6 +172,12 @@ def parse_screen(text: str) -> str:
     return min(hits)[1] if hits else ""
 
 
+def parse_view(text: str) -> str:
+    """'2d' | '3d' | '' (none / unparsed) from the second word of the screen answer."""
+    m = re.search(r"\b(2\.5|2|3)\s*-?d\b", strip_thinking(text).lower())
+    return ("3d" if m.group(1) == "3" else "2d") if m else ""  # 2.5D counts as 2D
+
+
 def parse(text: str, w: int, h: int) -> dict | None:
     """Back-compat single-prompt parser (game_box + overlays_in_game/layout_panels)."""
     d = _json(text)
@@ -232,14 +241,15 @@ def calibrate_coords(vlm, log) -> bool:
     return normalized
 
 
-def combine(game: dict | None, elements: list | None, screen: str = "") -> dict | None:
+def combine(game: dict | None, elements: list | None, screen: str = "", view: str = "") -> dict | None:
     """One frame: game box from the game question, refined by the elements from the layout question."""
     if game is None and elements is None:
         return None
     g = game["game"] if game else [0.0, 0.0, 1.0, 1.0]
     els = elements or []
     return {"game": g, "overlays": [b for _, b in els], "elements": els,
-            "screen": screen or (game["screen"] if game else ""), "stream": bool(els) or g != [0.0, 0.0, 1.0, 1.0]}
+            "screen": screen or (game["screen"] if game else ""), "view": view,
+            "stream": bool(els) or g != [0.0, 0.0, 1.0, 1.0]}
 
 
 # ============================================================================ frame grabbing
@@ -385,6 +395,9 @@ def aggregate(results: list[dict], full_thresh: float) -> dict:
     return {"game_area": None if full else json.dumps({"xtl": g[0], "ytl": g[1], "xbr": g[2], "ybr": g[3]}),
             "game_area_frac": float(area), "box_spread": spread, "overlays": json.dumps(keep),
             "frac_gameplay": float(np.mean([s == "gameplay" for s in screens])),
+            # share of probes judged 3D among those with a 2d/3d answer (NaN = no answer: old cache or no gameplay)
+            "frac_3d": (float(np.mean([r.get("view") == "3d" for r in results if r.get("view")]))
+                        if any(r.get("view") for r in results) else float("nan")),
             "stream_layout": bool(np.mean([r["stream"] for r in results]) >= 0.5), "n_frames": len(results)}
 
 
@@ -500,9 +513,11 @@ def main():
         for (v, fi, kind, w, h), txt in zip(owners, outs):
             answers.setdefault((v, fi), {})[kind] = (parse_game(txt, w, h) if kind == "game" else
                                                      parse_layout(txt, w, h) if kind == "layout" else parse_screen(txt))
+            if kind == "screen":
+                answers[(v, fi)]["view"] = parse_view(txt)
         per_vid: dict[str, list[dict]] = {}
         for (v, fi), a in sorted(answers.items()):
-            r = combine(a.get("game"), a.get("layout"), a.get("screen") or "")
+            r = combine(a.get("game"), a.get("layout"), a.get("screen") or "", a.get("view") or "")
             if r:
                 per_vid.setdefault(v, []).append(r)
         for v, frames, err, method, secs in got:

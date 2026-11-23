@@ -54,7 +54,10 @@ They are used to train a generative video world model.
    watermarks, webcams, controller overlays, blurred/smudged patches or black bars. Do not name the game.
 2. screens: for EACH of the {n} images, what is on screen: one of {screens}. "gameplay" means the player is
    controlling a character/vehicle in the game world (HUD visible is fine); pause/option/inventory screens are not.
-3. game_title: the game's title if you recognize it with reasonable confidence, else null.
+3. is_2d: true if the player moves on a flat plane seen from a fixed side, overhead or isometric camera (side-scrollers,
+   top-down, fighting games, and 2.5D games drawn with 3D models but played on a 2D plane); false if the player moves
+   freely in depth with a camera behind or around them.
+4. game_title: the game's title if you recognize it with reasonable confidence, else null.
 
 Respond with JSON only, no markdown:
 {{"caption": "...", "perspective": "side-scrolling|top-down|isometric|3d|other", "is_2d": true|false,

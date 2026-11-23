@@ -80,7 +80,8 @@ def main():
                     help="npy stores raw uint8 frames (~120 MB per 600-frame 336x192 clip!)")
     ap.add_argument("--splits", nargs="+", default=["train", "val_unseen_games"])
     ap.add_argument("--allow-missing-caption", action="store_true")
-    ap.add_argument("--drop-vlm-3d", action="store_true", help="drop chunks the VLM judged not 2D")
+    ap.add_argument("--drop-vlm-3d", action=argparse.BooleanOptionalAction, default=True,
+                    help="drop chunks the stage-04 VLM judged 3D (default on; --no-drop-vlm-3d to keep them)")
     ap.add_argument("--drop-dark-frame0", action="store_true")
     ap.add_argument("--min-gameplay-frac", type=float, default=0.75,
                     help="drop clips where stage 04's VLM saw gameplay in fewer than this fraction of sampled frames "
