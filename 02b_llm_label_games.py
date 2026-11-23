@@ -172,6 +172,38 @@ def game_level_pass(df: pd.DataFrame, args, log, out_path: Path) -> pd.DataFrame
     return cache
 
 
+def write_review_list(df: pd.DataFrame, lab, out_path: Path, args, log) -> None:
+    """Games the curated list doesn't cover whose 2D/3D call is uncertain: the current game-level answer
+    disagrees with a previous run (--compare-with, default the .bak from the last re-ask) or is unknown /
+    low-confidence. Sorted by hours -> the most valuable games to label by hand in config/game_labels.csv."""
+    cur_p = out_path.with_name("llm_game_perspectives.parquet")
+    if not cur_p.exists():
+        return
+    cur = pd.read_parquet(cur_p).set_index("llm_game_key")
+    prev_p = Path(args.compare_with) if args.compare_with else cur_p.with_suffix(".parquet.bak")
+    prev = pd.read_parquet(prev_p).set_index("llm_game_key") if prev_p.exists() else None
+    g = (df[df.llm_game.notna()].groupby("llm_game_key")
+         .agg(game=("llm_game", lambda x: x.mode().iat[0]), videos=("video_id", "size"), hours=("hours", "sum"),
+              sample_titles=("yt_title", lambda x: " || ".join(t[:70] for t in x.dropna().head(3)))))
+    g = g[g["game"].map(lambda n: lab.label_slug(n)[0] == "unknown")]  # curated games don't need review
+    g["persp_now"] = cur["game_perspective"].reindex(g.index)
+    g["conf_now"] = cur["game_confidence"].reindex(g.index)
+    is2d = lambda p: p.isin(["side-view-2d", "top-down-2d"])  # noqa: E731
+    reason = pd.Series("", index=g.index)
+    if prev is not None:
+        g["persp_prev"] = prev["game_perspective"].reindex(g.index)
+        flip = g["persp_prev"].notna() & (is2d(g["persp_now"]) != is2d(g["persp_prev"]))
+        reason[flip] = "runs disagree"
+    unk = g["persp_now"].isna() | g["persp_now"].isin(["unknown", "mixed"]) | (g["conf_now"].fillna(0) < 0.6)
+    reason[unk & (reason == "")] = "unknown/low-confidence"
+    g["reason"] = reason
+    rev = g[g["reason"] != ""].sort_values("hours", ascending=False)
+    rev_path = out_path.with_name("llm_review_games.csv")
+    rev.reset_index().to_csv(rev_path, index=False)
+    log.info("Review list: %d uncertain non-curated games, %.0f h -> %s (top 10: %s)", len(rev), rev.hours.sum(),
+             rev_path, ", ".join(f"{r.game} {r.hours:.0f}h" for r in rev.head(10).itertuples()))
+
+
 _LLM = None
 
 
@@ -235,6 +267,8 @@ def main():
                     help="any instruct LLM; bigger models know more obscure games")
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--skip-game-pass", action="store_true", help="skip the per-game perspective pass")
+    ap.add_argument("--compare-with", default=None,
+                    help="previous llm_game_perspectives parquet to diff against (default: the .bak from the last re-ask)")
     ap.add_argument("--max-new-tokens", type=int, default=160)
     ap.add_argument("--max-model-len", type=int, default=2048, help="prompts are ~700 tokens")
     ap.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True,
@@ -334,6 +368,7 @@ def main():
         df["final_perspective"] = df["llm_perspective"]
     df = df.merge(idx.groupby("video_id")["duration"].sum().div(3600).rename("hours"), left_on="video_id",
                   right_index=True, how="left")
+    write_review_list(df, lab, out_path, args, log)
     print("\n" + "=" * 78)
     print(f" LLM game labels: {len(df):,} videos, {df.hours.sum():,.0f} h -> {out_path}")
     print(f" identified (conf>=0.6, single game): "
