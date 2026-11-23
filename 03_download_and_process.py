@@ -392,6 +392,7 @@ def decode_process_encode(input_args: list[str], row, src_wh: tuple[int, int], f
             enc.wait()
     if enc.returncode != 0:
         raise RuntimeError(f"encoder failed: {(tmp / 'enc.log').read_text()[-500:]}")
+    geo["frac_black"] = float(np.mean([f.mean() < 8 for f in frames]))  # fades / loading / signal loss
     geo.update(crop_src=list(crop_src), src_wh=[src_w, src_h], analysis_wh=[aw, ah], borders=list(borders),
                inpaint_boxes=boxes, inpaint_frac=float((mask > 0).sum()) / max(1, W * H))
     return decoded, geo
@@ -515,6 +516,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
             "content_wh": geo["content_wh"], "crop_src": geo["crop_src"], "src_wh": geo["src_wh"],
             "analysis_wh": geo["analysis_wh"], "border_crop_ltrb": geo["borders"],
             "inpaint_boxes": geo["inpaint_boxes"], "inpaint_frac": geo["inpaint_frac"], "decoded_frames": int(decoded),
+            "frac_black": geo["frac_black"], "layout_override": bool(getattr(row, "layout_override", False)),
             "padded_frames": int(n_out - decoded), "method": method_used, "format_id": info.get("format_id"),
             "vcodec": args.vcodec, "enc_args": args.enc_args, "original_metadata": orig,
             "processed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -572,6 +574,41 @@ def stage_actions(man: pd.DataFrame, args, log) -> None:
             d = processed_dir_for(args.processed_dir, vid_of[u], u)
             d.mkdir(parents=True, exist_ok=True)
             np.save(d / "_actions_src.npy", a)
+
+
+def apply_layout_overrides(man: pd.DataFrame, args, log) -> pd.DataFrame:
+    """Fill bbox_game_area / extend bbox_others from 02c's per-video layout detection."""
+    p = Path(args.layout_overrides)
+    has_ga = man["bbox_game_area"].map(lambda s: isinstance(_jload(s), dict))
+    if not p.exists():
+        if args.require_layout_check:
+            log.warning("--require-layout-check but %s missing: skipping %d chunks without bbox_game_area", p, (~has_ga).sum())
+            return man[has_ga]
+        log.warning("No %s: stream layouts (chat/webcam panels) in videos without bbox_game_area will NOT be "
+                    "cropped. Run 02c_detect_layout.py first.", p.name)
+        return man
+    lo = pd.read_parquet(p)
+    ok = lo[lo["status"] == "ok"].set_index("video_id")
+    vid = man["video_id"]
+    fill = ~has_ga & vid.isin(ok.index) & vid.map(ok["game_area"]).notna()
+    man.loc[fill, "bbox_game_area"] = vid[fill].map(ok["game_area"])
+    man["layout_override"] = fill
+    with_ov = vid.isin(ok.index[ok["overlays"].fillna("[]") != "[]"])
+
+    def merge_others(row_others, video):
+        cur = _jload(row_others) or []
+        extra = [{"xtl": b[0], "ytl": b[1], "xbr": b[2], "ybr": b[3]} for b in json.loads(ok.at[video, "overlays"])]
+        return json.dumps(cur + extra)
+    man.loc[with_ov, "bbox_others"] = [merge_others(o, v) for o, v in zip(man.loc[with_ov, "bbox_others"], vid[with_ov])]
+    keep = pd.Series(True, index=man.index)
+    if args.require_layout_check:
+        keep &= has_ga | vid.isin(ok.index)
+    if args.min_video_gameplay_frac > 0:
+        keep &= ~vid.map(ok["frac_gameplay"]).fillna(1.0).lt(args.min_video_gameplay_frac)
+    log.info("Layout overrides: game area filled for %s chunks (%d videos), overlays added for %s chunks; "
+             "%s chunks skipped by layout filters", f"{fill.sum():,}", vid[fill].nunique(), f"{with_ov.sum():,}",
+             f"{(~keep).sum():,}")
+    return man[keep]
 
 
 def load_failed(path: Path) -> dict[str, dict]:
@@ -658,6 +695,12 @@ def main():
     ap.add_argument("--max-bot-streak", type=int, default=30,
                     help="stop submitting after this many consecutive bot-check/429 failures (IP is blocked)")
     ap.add_argument("--status", action="store_true", help="print progress and exit")
+    ap.add_argument("--layout-overrides", default=str(DATA_ROOT / "layout_overrides.parquet"),
+                    help="per-video game areas / overlay boxes from 02c_detect_layout.py (used if the file exists)")
+    ap.add_argument("--require-layout-check", action="store_true",
+                    help="skip videos without bbox_game_area that 02c hasn't checked yet (avoids encoding stream layouts)")
+    ap.add_argument("--min-video-gameplay-frac", type=float, default=0.0,
+                    help="skip videos where 02c saw gameplay in fewer than this fraction of its probe frames")
     args = ap.parse_args()
 
     args.bucket_list = (auto_buckets(CANONICAL_BUCKETS, args.max_crop) if args.buckets == "auto"
@@ -671,6 +714,7 @@ def main():
         if shutil.which(tool) is None:
             raise SystemExit(f"'{tool}' not found on PATH")
     man = pd.read_parquet(args.manifest)
+    man = apply_layout_overrides(man, args, log)
     if args.split != "all":
         man = man[man.split == args.split]
     # interleave games so early progress covers many titles (and spreads load across videos)

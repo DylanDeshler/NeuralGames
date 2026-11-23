@@ -55,6 +55,8 @@ def main():
     ap.add_argument("--allow-missing-caption", action="store_true")
     ap.add_argument("--drop-vlm-3d", action="store_true", help="drop chunks the VLM judged not 2D")
     ap.add_argument("--drop-dark-frame0", action="store_true")
+    ap.add_argument("--max-black-frac", type=float, default=0.25,
+                    help="drop clips where more than this fraction of frames is near-black (fades, loading)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--delete-processed", action="store_true",
@@ -86,7 +88,7 @@ def main():
         sm = man[man.split == split]
         # shuffle so each shard mixes games (important for streaming training)
         sm = sm.sample(frac=1.0, random_state=args.seed)
-        drops = {"not_processed": 0, "no_caption": 0, "vlm_3d": 0, "dark": 0, "bad_shape": 0}
+        drops = {"not_processed": 0, "no_caption": 0, "vlm_3d": 0, "dark": 0, "black_frames": 0, "bad_shape": 0}
         stats: dict[str, dict] = {}   # bucket -> {samples, frames, hours, width, height}
         writers: dict[str, "wds.ShardWriter"] = {}
         pending_del: dict[str, list[Path]] = {}  # bucket -> clip dirs whose shard is still open
@@ -115,6 +117,9 @@ def main():
                     continue
                 if args.drop_dark_frame0 and meta.get("frame0_dark"):
                     drops["dark"] += 1
+                    continue
+                if meta.get("frac_black", 0.0) > args.max_black_frac:
+                    drops["black_frames"] += 1
                     continue
                 acts = np.load(d / "actions.npy")
                 if acts.ndim != 2 or acts.shape[1] != ACTION_DIM or acts.shape[0] != meta["n_frames"]:

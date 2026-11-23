@@ -8,6 +8,7 @@ can be resumed: re-running a stage skips work that's already done.
 01_fetch_metadata.py      HF tarballs -> compact per-shard index + action parquet       (CPU, ~25-60 GB)
 02b_llm_label_games.py    (optional) LLM names the game per video from YouTube metadata    (GPU, ~minutes)
 02_profile_and_sample.py  2D filter, idle filter, alpha-sampling, game holdout -> manifest (CPU, minutes)
+02c_detect_layout.py      VLM finds the game screen inside stream layouts (chat/webcam), per video (GPU+net)
 03_download_and_process.py  20 s clip fetch, aspect bucket (no letterbox), inpaint, align (network-bound)
 04_caption_frames.py      Qwen2.5-VL caption of frame 0 (vLLM / transformers / OpenAI API) (GPU)
 05_pack_webdataset.py     ~1 GB WebDataset shards: train/ and val_unseen_games/
@@ -165,6 +166,19 @@ re-weighting can also be done at training time with sampling weights.
   `val_unseen_games`. Keyword-only `unk:<video>` games always stay in train.
 
 Outputs: `data/manifest_2d.parquet` plus `data/reports/*.csv`, `sampling_info.json`.
+
+### 2c. Stream-layout detection (before downloading clips)
+Many videos are stream captures whose frame also holds Twitch chat, a webcam, alerts or decorative
+panels, and NitroGen has no `bbox_game_area` for them. In the first real smoke test this affected 4 of 16 clips.
+`02c_detect_layout.py` grabs 3 frames per such video and asks Qwen2.5-VL for the game-screen rectangle
+plus any webcam/chat boxes on top of it. The median across frames is written to
+`layout_overrides.parquet`; stage 03 uses it as the crop and inpaints the overlay boxes.
+```bash
+python 02c_detect_layout.py --proxy http://127.0.0.1:8899 --limit 50   # check the summary line, then run without --limit
+python 03_download_and_process.py --proxy http://127.0.0.1:8899 --require-layout-check ...
+```
+`--require-layout-check` makes stage 03 skip videos 02c hasn't checked yet, so no chat or webcam layouts
+slip in. `--min-video-gameplay-frac 0.5` additionally skips videos whose probe frames were mostly menus.
 
 ### 3. Download + process clips
 ```bash
