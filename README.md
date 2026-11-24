@@ -391,7 +391,8 @@ is used when present, otherwise `actions_raw.parquet` (recorded as `action_sourc
 
 `actions.npy` is pooled to 15 fps: each output frame covers `frame_stride` native frames (4 at 60 fps).
 Sticks are averaged and buttons OR'd, so a tap is never lost. Each sample also carries
-`actions_native.npy`: `(T * frame_stride, 21)` float16 at the annotation fps. Native frame `j` belongs to
+`actions_native.npy`: `(T * frame_stride, 21)` int8 at the annotation fps (sticks stored as `round(x * 127)`,
+buttons 0/1; decode with `ng_masks.native_to_float`). Native frame `j` belongs to
 output frame `j // frame_stride`.
 
 ### Action lag (important)

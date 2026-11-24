@@ -74,14 +74,17 @@ def check_sample(key: str, s: dict, game_ids: dict, allow_missing_caption: bool 
     if meta.get("n_frames") != T:
         errs.append(f"json n_frames={meta.get('n_frames')} != len(frames)={T}")
     if "actions_native.npy" in s:  # native-rate actions: right length, and pooling them reproduces actions.npy
-        nat = np.load(io.BytesIO(s["actions_native.npy"])).astype(np.float32)
+        nat = np.load(io.BytesIO(s["actions_native.npy"]))
+        if nat.dtype == np.int8:  # sticks stored as round(x * 127)
+            nat = nat.astype(np.float32); nat[:, :4] /= 127.0
+        nat = nat.astype(np.float32)
         k = int(meta.get("frame_stride") or 1)
         if nat.shape != (T * k, ACTION_DIM):
             errs.append(f"actions_native shape {nat.shape} != ({T}*{k}, {ACTION_DIM})")
         elif len(acts) == T:
             g = nat.reshape(T, k, ACTION_DIM)
             pooled = np.concatenate([g[:, :, :4].mean(1), g[:, :, 4:].max(1)], axis=1)
-            if np.abs(pooled - acts).max() > 2e-3:  # float16 storage
+            if np.abs(pooled - acts).max() > 6e-3:  # 8-bit sticks: <= 0.5/127 error
                 errs.append(f"pooled actions_native != actions (max diff {np.abs(pooled - acts).max():.4f})")
     if acts.dtype != np.float32 or acts.ndim != 2 or acts.shape[1] != ACTION_DIM:
         errs.append(f"actions dtype/shape {acts.dtype} {acts.shape}")

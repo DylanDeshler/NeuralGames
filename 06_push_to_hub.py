@@ -54,6 +54,8 @@ def main():
     ap.add_argument("--public", action="store_true", help="create the repo PUBLIC (default: private)")
     ap.add_argument("--delete-local", action="store_true", help="delete shards after a verified upload")
     ap.add_argument("--revision", default="main")
+    ap.add_argument("--max-repo-gb", type=float, default=950.0,
+                    help="refuse to push past this total repo size (private storage quota; 0 = no limit)")
     ap.add_argument("--tag", default="", help="machine tag (multi-machine builds): index.json is uploaded as index_<tag>.json")
     args = ap.parse_args()
 
@@ -89,6 +91,15 @@ def main():
     if not new and not meta_files:
         log.info("Nothing to push.")
         return
+    if args.max_repo_gb > 0 and new:  # private storage quota: never start an upload that would overflow it
+        used = sum(getattr(e, "size", 0) or 0 for e in api.list_repo_tree(args.repo_id, repo_type="dataset",
+                                                                          recursive=True, revision=args.revision))
+        log.info("Repo uses %.1f GB of the %.0f GB budget; this push adds %.1f GB", used / 1e9, args.max_repo_gb, gb)
+        if used / 1e9 + gb > args.max_repo_gb:
+            log.error("Pushing would exceed --max-repo-gb %.0f (%.1f + %.1f GB). Shards kept locally; stopping. Raise "
+                      "the budget, or lower the encode size (e.g. CRF 20) for the rest of the build.",
+                      args.max_repo_gb, used / 1e9, gb)
+            raise SystemExit(4)
     api.create_commit(args.repo_id, repo_type="dataset", operations=ops, revision=args.revision,
                       commit_message=f"add {len(new)} shards ({gb:.1f} GB)")
 

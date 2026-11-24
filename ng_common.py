@@ -269,6 +269,16 @@ def _json_default(o):
     return str(o)
 
 
+def encode_native_actions(a: np.ndarray) -> np.ndarray:
+    """Native-rate actions -> int8 (T, 21): sticks round(x * 127) (8-bit, like a controller ADC), buttons 0/1.
+    ~25 KB per 20 s clip at 60 fps instead of 50 KB as float16. Decode with ng_masks.native_to_float()."""
+    a = np.asarray(a, np.float32)
+    out = np.empty(a.shape, np.int8)
+    out[:, :4] = np.round(np.clip(a[:, :4], -1, 1) * 127)
+    out[:, 4:] = a[:, 4:] > 0.5
+    return out
+
+
 def processed_dir_for(processed_root: str | Path, video_id: str, uuid: str) -> Path:
     return Path(processed_root) / video_id / uuid
 

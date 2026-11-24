@@ -52,7 +52,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 from tqdm import tqdm
 
-from ng_common import default_cookies, DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, free_gb, processed_dir_for, setup_logging
+from ng_common import default_cookies, encode_native_actions, DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, free_gb, processed_dir_for, setup_logging
 
 PERMANENT_ERR = re.compile(
     r"(private video|video unavailable|video is unavailable|does not exist|has been removed|no longer available|account associated|"
@@ -626,7 +626,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
         np.save(work / "actions.npy", acts.astype(np.float32))
         # native-rate actions too (float16, n_ann x 21): overlay-vs-frame lag is often 1-3 native frames (capture /
         # OBS latency), below one output frame, so pooled actions alone can't be re-aligned at training time
-        np.save(work / "actions_native.npy", np.asarray(actions[:n_out * stride], np.float16))
+        np.save(work / "actions_native.npy", encode_native_actions(actions[:n_out * stride]))
         orig = _jload(row.meta_json) or {}
         meta = {
             "uuid": row.uuid, "video_id": row.video_id, "chunk_id": int(row.chunk_id), "split": row.split,
@@ -728,7 +728,7 @@ def backfill_native_actions(man: pd.DataFrame, args, log) -> None:
             if np.abs(pool_actions(a, int(m["frame_stride"]), int(m["n_frames"])) - pooled).max() > 1e-4:
                 log.warning("backfill: %s native actions don't pool to the stored ones, skipped", u)
                 continue
-            np.save(processed_dir_for(args.processed_dir, m["video_id"], u) / "actions_native.npy", a.astype(np.float16))
+            np.save(processed_dir_for(args.processed_dir, m["video_id"], u) / "actions_native.npy", encode_native_actions(a))
             n_ok += 1
     log.info("backfill: wrote actions_native.npy for %d / %d clips", n_ok, len(need))
 

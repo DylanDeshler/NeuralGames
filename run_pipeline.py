@@ -83,7 +83,11 @@ def net_args(a) -> list[str]:
 
 
 def bucket_args(a) -> list[str]:
-    return ["--buckets", a.buckets] if a.buckets else []
+    """Output-geometry/encode options shared by every stage-03 call."""
+    out = ["--buckets", a.buckets] if a.buckets else []
+    if a.crf is not None:
+        out += ["--enc-args", f"-preset medium -crf {a.crf} -pix_fmt yuv444p"]
+    return out
 
 
 def qc_args(a) -> list[str]:
@@ -506,6 +510,7 @@ def main():
     ap.add_argument("--skip-layout", action="store_true", help="don't run 02c (already done)")
     ap.add_argument("--buckets", default=None,
                     help="passed to stage 03, e.g. '21x12' (single 16:9 canvas, others padded) or '21x12,19x14'")
+    ap.add_argument("--crf", type=int, default=None, help="x264 CRF for stage 03 (default 18; 20 is ~20-25%% smaller)")
     ap.add_argument("--qc-frames", type=int, default=None, help="passed to stage 04 (frames per clip for the QC)")
     ap.add_argument("--min-gameplay-frac", type=float, default=None, help="passed to stage 05")
     ap.add_argument("--start-vlm-server", action="store_true",

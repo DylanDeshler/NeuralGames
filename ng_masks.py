@@ -123,15 +123,24 @@ def fit_to_canvas(frames: np.ndarray, valid: np.ndarray, W: int, H: int, max_cro
 # The NitroGen action labels are read from the on-screen controller overlay, which often leads or lags the
 # rendered game frame by 1-3 native (60 fps) frames (capture-card / OBS latency, constant per recording setup).
 # That is below one 15 fps output frame, so it can only be corrected from the native-rate actions stored in
-# each sample (`actions_native.npy`, (T * frame_stride, 21) float16). Two complementary fixes:
+# each sample (`actions_native.npy`, (T * frame_stride, 21) int8: sticks * 127, buttons 0/1; decode with
+# native_to_float). Two complementary fixes:
 #   1. realign_actions(native, stride, shift): re-pool with a shift of `shift` native frames;
 #   2. action_history(acts, k): condition step t on [a_{t-k+1}, ..., a_t] instead of a_t alone, so the model
 #      can absorb a small residual lag (k = 2-3 output frames covers +-1-3 native frames).
 
+def native_to_float(native: np.ndarray) -> np.ndarray:
+    """Decode stored native actions: int8 (sticks * 127, buttons 0/1) -> float32 in the actions.npy convention."""
+    a = native.astype(np.float32)
+    if native.dtype == np.int8:
+        a[:, :4] /= 127.0
+    return a
+
+
 def pool_native(native: np.ndarray, stride: int) -> np.ndarray:
     """Same pooling as stage 03: sticks (first 4 dims) averaged, buttons (17) OR'd over each output frame."""
     T = len(native) // stride
-    g = native[: T * stride].astype(np.float32).reshape(T, stride, native.shape[1])
+    g = native_to_float(native[: T * stride]).reshape(T, stride, native.shape[1])
     return np.concatenate([g[:, :, :4].mean(1), g[:, :, 4:].max(1)], axis=1)
 
 
@@ -141,7 +150,7 @@ def realign_actions(native: np.ndarray, stride: int, shift: int = 0) -> np.ndarr
     shift > 0 means the overlay LAGS the picture (an input shows up on the overlay `shift` frames after its
     effect is visible): actions are moved earlier. Edges are padded by repeating the first/last frame, so the
     output has the same length as the stored actions."""
-    a = native.astype(np.float32)
+    a = native_to_float(native)
     if shift > 0:
         a = np.concatenate([a[shift:], np.repeat(a[-1:], shift, 0)])
     elif shift < 0:
