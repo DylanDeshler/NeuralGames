@@ -101,6 +101,7 @@ def main():
     ap.add_argument("--append", action="store_true",
                     help="add newly processed clips to existing shards (new shard files; already-packed uuids skipped). "
                          "Use with --delete-processed for repeated download/pack cycles")
+    ap.add_argument("--tag", default="", help="machine tag in shard names (train-21x12-<tag>-000000.tar) for multi-machine builds")
     ap.add_argument("--delete-processed", action="store_true",
                     help="delete each processed clip dir once the shard containing it is closed (halves peak disk; "
                          "processed/ can't be re-packed afterwards)")
@@ -121,6 +122,10 @@ def main():
     atomic_write_json(gid_path, game_ids)
 
     leak_videos = name_check(man, args, out, log)
+
+    def prefix(split: str, bucket: str) -> str:
+        """Shard file prefix; --tag keeps several build machines' shards apart on the Hub."""
+        return f"{split}-{bucket}-{args.tag}-" if args.tag else f"{split}-{bucket}-"
 
     for split in args.splits:
         sdir = out / split
@@ -148,15 +153,34 @@ def main():
         state_path = sdir / "_next_shard.json"
         next_shard: dict[str, int] = json.loads(state_path.read_text()) if (args.append and state_path.exists()) else {}
         writers: dict[str, "wds.ShardWriter"] = {}
-        pending_del: dict[str, list[Path]] = {}  # bucket -> clip dirs whose shard is still open
+        pending_del: dict[str, list[tuple[Path, str]]] = {}  # bucket -> (clip dir, uuid) whose shard is still open
         n_deleted = 0
+        recorded: set[str] = set()  # uuids already appended to _packed_uuids.txt during this run
+        dropped_path = sdir / "_dropped_uuids.txt"
 
-        def flush_deletes(dirs: list[Path]):
+        def flush_deletes(entries: list[tuple[Path, str]], bucket: str | None = None):
+            """The shard holding these clips is closed: record them as packed FIRST (so a crash can't lose them:
+            stage 03 skips packed/dropped uuids), persist the shard counter, then delete the clip dirs."""
             nonlocal n_deleted
-            for dd in dirs:
+            if not entries:
+                return
+            uu = [u for _, u in entries]
+            with open(packed_path, "a") as fh:
+                fh.write("\n".join(uu) + "\n")
+            recorded.update(uu)
+            if bucket is not None and bucket in writers:  # the open shard (w.shard - 1) gets rewritten on restart
+                next_shard[bucket] = max(next_shard.get(bucket, 0), int(getattr(writers[bucket], "shard", 1)) - 1)
+                atomic_write_json(state_path, next_shard)
+            for dd, _ in entries:
                 shutil.rmtree(dd, ignore_errors=True)
                 n_deleted += 1
-            dirs.clear()
+            entries.clear()
+
+        def drop_dir(d: Path, uuid: str):
+            """Dropped for quality in --delete-processed mode: remember it (03 must not re-download it), free disk."""
+            with open(dropped_path, "a") as fh:
+                fh.write(uuid + "\n")
+            shutil.rmtree(d, ignore_errors=True)
         try:
             for row in tqdm(sm.itertuples(index=False), total=len(sm), desc=f"pack {split}"):
                 d = processed_dir_for(args.processed_dir, row.video_id, row.uuid)
@@ -171,6 +195,8 @@ def main():
                     continue
                 if args.drop_vlm_3d and meta.get("vlm_is_2d") is False:
                     drops["vlm_3d"] += 1
+                    if args.delete_processed:
+                        drop_dir(d, row.uuid)
                     continue
                 if args.drop_dark_frame0 and meta.get("frame0_dark"):
                     drops["dark"] += 1
@@ -179,17 +205,17 @@ def main():
                 if args.min_gameplay_frac > 0 and "caption" in meta and fg is None and not args.allow_missing_caption:
                     drops["qc_unparsed"] += 1
                     if args.delete_processed:
-                        shutil.rmtree(d, ignore_errors=True)  # dropped for quality: free the disk too  # stage 04 ran but its QC output didn't parse: don't let it pass silently
+                        drop_dir(d, row.uuid)  # stage 04 ran but its QC output didn't parse: don't let it pass silently
                     continue
                 if args.min_gameplay_frac > 0 and fg is not None and fg < args.min_gameplay_frac:
                     drops["non_gameplay"] += 1
                     if args.delete_processed:
-                        shutil.rmtree(d, ignore_errors=True)  # dropped for quality: free the disk too
+                        drop_dir(d, row.uuid)
                     continue
                 if args.require_frame0_gameplay and scr and scr[0] != "gameplay":
                     drops["frame0_not_gameplay"] += 1
                     if args.delete_processed:
-                        shutil.rmtree(d, ignore_errors=True)  # dropped for quality: free the disk too  # frame 0 is the caption/conditioning frame
+                        drop_dir(d, row.uuid)  # frame 0 is the caption/conditioning frame
                     continue
                 if split == "val_unseen_games" and row.video_id in leak_videos:
                     drops["val_leak"] += 1
@@ -197,7 +223,7 @@ def main():
                 if meta.get("frac_black", 0.0) > args.max_black_frac:
                     drops["black_frames"] += 1
                     if args.delete_processed:
-                        shutil.rmtree(d, ignore_errors=True)  # dropped for quality: free the disk too
+                        drop_dir(d, row.uuid)
                     continue
                 acts = np.load(d / "actions.npy")
                 if acts.ndim != 2 or acts.shape[1] != ACTION_DIM or acts.shape[0] != meta["n_frames"]:
@@ -207,8 +233,15 @@ def main():
                 if bucket not in writers:  # one shard series per aspect bucket -> same-shape batches
                     (sdir / bucket).mkdir(parents=True, exist_ok=True)
                     # continue numbering from persistent state (local shards may have been uploaded and deleted)
-                    start = max(next_shard.get(bucket, 0), len(list((sdir / bucket).glob("*.tar"))))
-                    writers[bucket] = wds.ShardWriter(str(sdir / bucket / f"{split}-{bucket}-%06d.tar"),
+                    if bucket in next_shard:
+                        start = next_shard[bucket]
+                        for stale in (sdir / bucket).glob(f"{prefix(split, bucket)}*.tar"):  # shard that was open when a run was killed:
+                            if int(stale.stem.rsplit("-", 1)[-1]) >= start:  # its clips were never recorded, repack
+                                log.warning("[%s] removing unfinished shard %s from an interrupted run", split, stale.name)
+                                stale.unlink()
+                    else:
+                        start = len(list((sdir / bucket).glob(f"{prefix(split, bucket)}*.tar")))
+                    writers[bucket] = wds.ShardWriter(str(sdir / bucket / f"{prefix(split, bucket)}%06d.tar"),
                                                       maxsize=int(args.shard_size_gb * 1e9),
                                                       maxcount=args.max_samples_per_shard, verbose=0,
                                                       start_shard=start)
@@ -219,6 +252,7 @@ def main():
                     "uuid": row.uuid, "game_id": gid, "game": meta.get("game"), "game_key": row.game_key,
                     "genre": meta.get("genre"), "split": split, "video_id": row.video_id,
                     "chunk_id": meta.get("chunk_id"), "fps": meta["fps"], "n_frames": meta["n_frames"],
+                    "frame_stride": meta.get("frame_stride"), "annotation_fps": meta.get("annotation_fps"),
                     "width": meta["width"], "height": meta["height"], "bucket": bucket, "patch": meta.get("patch"),
                     "fit_mode": meta.get("fit_mode"), "aspect_crop_frac": meta.get("aspect_crop_frac"),
                     "pad": meta["pad"], "content_wh": meta["content_wh"],
@@ -235,6 +269,8 @@ def main():
                 np.save(abuf, acts.astype(np.float32))
                 sample = {"__key__": row.uuid, "actions.npy": abuf.getvalue(), "txt": cap or "",
                           "cls": str(gid), "json": json.dumps(info).encode()}
+                if (d / "actions_native.npy").exists():  # (T*stride, 21) float16 at annotation fps, see README
+                    sample["actions_native.npy"] = (d / "actions_native.npy").read_bytes()
                 if args.frames_format == "mp4":
                     sample["mp4"] = (d / "frames.mp4").read_bytes()
                 else:
@@ -246,8 +282,8 @@ def main():
                 w.write(sample)
                 if args.delete_processed:
                     if getattr(w, "shard", None) != shard_before and shard_before is not None:
-                        flush_deletes(pending_del.setdefault(bucket, []))  # previous shard is closed on disk
-                    pending_del.setdefault(bucket, []).append(d)
+                        flush_deletes(pending_del.setdefault(bucket, []), bucket)  # previous shard is closed on disk
+                    pending_del.setdefault(bucket, []).append((d, row.uuid))
                 newly_packed.append(row.uuid)
                 st = stats[bucket]
                 st["samples"] += 1
@@ -258,13 +294,14 @@ def main():
                 next_shard[b] = max(next_shard.get(b, 0), int(getattr(w, "shard", 0)))
                 w.close()
             atomic_write_json(state_path, next_shard)
-        if args.delete_processed:  # all shards closed successfully
+        if args.delete_processed:  # all shards closed successfully (counter already saved above)
             for dirs in pending_del.values():
                 flush_deletes(dirs)
             log.info("[%s] deleted %s processed clip dirs after packing", split, f"{n_deleted:,}")
-        if newly_packed:  # record what's in the shards (append mode skips these next time)
+        rest = [u for u in newly_packed if u not in recorded]
+        if rest:  # record what's in the shards (append mode and stage 03 skip these next time)
             with open(packed_path, "a") as fh:
-                fh.write("\n".join(newly_packed) + "\n")
+                fh.write("\n".join(rest) + "\n")
         if prev_index and args.append:  # merge with what earlier runs packed
             for b, old in (prev_index.get("buckets") or {}).items():
                 st = stats.setdefault(b, {"samples": 0, "frames": 0, "hours": 0.0, "width": old["width"],

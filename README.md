@@ -106,7 +106,7 @@ python run_pipeline.py bulk  --proxy http://127.0.0.1:8899 --workers 8 --min-fre
 * **smoke** uses an isolated copy of the manifest and its own processed/shard dirs, so it never touches
   bulk outputs. It runs 02c (first 40 videos) → 03 (`--clips 20`) → 04 → 05 → verify → inspect, then
   bundles the debug grids, debug videos, `verify.txt`, `inspect.txt` and name mismatches into one tarball.
-* **bulk** runs 02c for every video (resumable), then repeats `03 --limit --cycle-clips` (20k clips, ~110 h)
+* **bulk** runs 02c for every video (resumable), then repeats `03 --limit --cycle-clips` (8k clips, ~44 h of video; clips left on disk by an interrupted run count toward the cycle)
   → `04` → `05 --append --delete-processed` until the manifest is done, the disk floor is reached, or
   downloads stop. Stop it any time (Ctrl-C) and re-run the same command to resume.
 * `--resample` re-runs stage 02 first, `--skip-layout` skips 02c, and `--dry-run` prints the commands.
@@ -117,6 +117,42 @@ python run_pipeline.py bulk  --proxy http://127.0.0.1:8899 --workers 8 --min-fre
   overwritten, and `index.json` keeps listing uploaded shards. Training streams the shards from the Hub (see
   the docstring of `06_push_to_hub.py`). Repos are created private; `--public` is refused unless passed to 06
   explicitly. The videos aren't yours to redistribute, and NitroGen's labels are CC BY-NC.
+
+## Split build: CPU machines build, the GPU box captions
+Captioning (one VLM request per clip, ~1.8M clips for the full pool) is far slower than downloading, and the
+GPU box has few CPUs. So the work is split:
+
+| machine | runs | needs |
+|---|---|---|
+| GPU box | `run_pipeline.py gpu`: model server, 02c for every video (pushes `meta/layout_overrides.parquet` every 10 min), `07_caption_shards.py --follow` over shards as they arrive | GPU, cookies |
+| CPU box(es) | `run_pipeline.py build`: cycles of 03 → 05 (no captions) → verify → 06 push; pulls the manifest and layout file from `meta/` each cycle | many vCPUs, cookies, the stage-01 action files |
+
+```bash
+# GPU box
+python run_pipeline.py gpu --start-vlm-server --push-to-hub <user>/nitrogen-2d-wm
+# CPU box (one machine)
+python run_pipeline.py build --push-to-hub <user>/nitrogen-2d-wm --workers 32
+# or two CPU machines: disjoint videos, shard names tagged m0 / m1
+python run_pipeline.py build --push-to-hub <user>/nitrogen-2d-wm --workers 32 --machine-shard 0/2
+python run_pipeline.py build --push-to-hub <user>/nitrogen-2d-wm --workers 32 --machine-shard 1/2
+```
+CPU box setup: `pip install -r requirements.txt` (vLLM/torch lines not needed), ffmpeg, `bash
+tools/setup_youtube_access.sh`, and the stage-01 action files at `$NG_DATA_ROOT/nitrogen_meta/actions/`
+(`rsync -a gpu:/data/games/nitrogen_meta/ /data/games/nitrogen_meta/`, or re-run `01_fetch_metadata.py`).
+Use one throwaway YouTube account per machine. Build machines only process videos 02c has already checked,
+and they pick up new ones each cycle. Each machine pushes its packed-uuid list to `meta/packed/`, and stage 03
+on every machine skips those clips, so nothing is downloaded twice.
+
+### Captions sidecar
+`07_caption_shards.py` writes `captions/<split>/<bucket>/<shard>.parquet` next to the shards (uuid, caption,
+vlm_screens, vlm_frac_gameplay, vlm_is_2d, vlm_game_title, frame0_dark, ...). Shards are never rewritten.
+Stage 05's QC drops happen at load time instead:
+```python
+import pandas as pd
+cap = pd.read_parquet("hf://datasets/<user>/nitrogen-2d-wm/captions/")   # or a local copy
+cap = cap[(cap.vlm_frac_gameplay >= 0.75) & (cap.vlm_screens.str[0] == "gameplay") & (cap.vlm_is_2d != False)]
+keep = dict(zip(cap.uuid, cap.caption))          # in the WebDataset pipeline: select(lambda s: s["__key__"] in keep)
+```
 
 ## Step by step
 
@@ -352,6 +388,26 @@ action-shuffle test (prediction error should rise noticeably with shuffled actio
 left_thumb, left_trigger, right_shoulder, right_thumb, right_trigger, south, west, east, north, back,
 start, guide]`. Sticks are in [-1, 1] (y = −1 is up); buttons are {0, 1}. `actions_processed.parquet`
 is used when present, otherwise `actions_raw.parquet` (recorded as `action_source`).
+
+`actions.npy` is pooled to 15 fps: each output frame covers `frame_stride` native frames (4 at 60 fps).
+Sticks are averaged and buttons OR'd, so a tap is never lost. Each sample also carries
+`actions_native.npy`: `(T * frame_stride, 21)` float16 at the annotation fps. Native frame `j` belongs to
+output frame `j // frame_stride`.
+
+### Action lag (important)
+The labels come from the on-screen controller overlay. On YouTube recordings, the overlay often leads or lags
+the rendered game frame by **1–3 native frames** because of capture-card and OBS encoding latency. The lag is
+usually constant for a given recording setup. That is less than one 15 fps frame, so it can only be corrected
+from `actions_native.npy`. Two fixes, which combine:
+* **Action history:** condition step t on `[a_{t-2}, a_{t-1}, a_t]` instead of `a_t` alone
+  (`ng_masks.action_history(acts, k=3)`). This noticeably improves jump and attack responsiveness. NitroGen's
+  own policy also applies a shift (`action_shift=3`).
+* **Re-alignment:** `ng_masks.realign_actions(native, stride, shift)` re-pools after shifting by `shift`
+  native frames (positive = the overlay lags the picture). The shift could be a global constant or a per-video
+  estimate, e.g. the shift that best lines up button onsets with motion onsets.
+
+Clips processed before native actions were stored can get them from the stage-01 files:
+`python 03_download_and_process.py --backfill-native` (checks that they pool to the stored actions).
 
 ## Known limitations
 * Labels are per video, but some streams contain several games (e.g. "SotN randomizer, then

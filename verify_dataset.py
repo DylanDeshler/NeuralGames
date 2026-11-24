@@ -73,6 +73,16 @@ def check_sample(key: str, s: dict, game_ids: dict, allow_missing_caption: bool 
         errs.append(f"len(frames)={T} != len(actions)={len(acts)}")
     if meta.get("n_frames") != T:
         errs.append(f"json n_frames={meta.get('n_frames')} != len(frames)={T}")
+    if "actions_native.npy" in s:  # native-rate actions: right length, and pooling them reproduces actions.npy
+        nat = np.load(io.BytesIO(s["actions_native.npy"])).astype(np.float32)
+        k = int(meta.get("frame_stride") or 1)
+        if nat.shape != (T * k, ACTION_DIM):
+            errs.append(f"actions_native shape {nat.shape} != ({T}*{k}, {ACTION_DIM})")
+        elif len(acts) == T:
+            g = nat.reshape(T, k, ACTION_DIM)
+            pooled = np.concatenate([g[:, :, :4].mean(1), g[:, :, 4:].max(1)], axis=1)
+            if np.abs(pooled - acts).max() > 2e-3:  # float16 storage
+                errs.append(f"pooled actions_native != actions (max diff {np.abs(pooled - acts).max():.4f})")
     if acts.dtype != np.float32 or acts.ndim != 2 or acts.shape[1] != ACTION_DIM:
         errs.append(f"actions dtype/shape {acts.dtype} {acts.shape}")
     else:
@@ -187,6 +197,8 @@ def main():
     ap.add_argument("--debug-videos", type=int, default=2)
     ap.add_argument("--out-dir", default=str(DATA_ROOT / "debug"))
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--allow-missing-split", action="store_true",
+                    help="a split without local shards is OK (per-cycle checks: earlier shards were pushed and deleted)")
     ap.add_argument("--allow-missing-caption", action="store_true",
                     help="don't fail samples without a caption (e.g. smoke tests before stage 04)")
     args = ap.parse_args()
@@ -201,7 +213,7 @@ def main():
         shards = sorted((root / split).rglob("*.tar"))
         if not shards:
             print(f"[{split}] no shards found")
-            total_fail += 1
+            total_fail += 0 if args.allow_missing_split else 1
             continue
         idx = json.loads((root / split / "index.json").read_text()) if (root / split / "index.json").exists() else {}
         print(f"\n[{split}] {len(shards)} shards, index: samples={idx.get('samples')} hours={idx.get('hours')} "
@@ -261,6 +273,9 @@ def main():
         else:
             print(f"\nOK: train ({len(games_by_split['train'])} games) and val_unseen_games "
                   f"({len(games_by_split['val_unseen_games'])} games) are disjoint")
+    if args.allow_missing_split and not any(sorted((root / sp).rglob("*.tar")) for sp in args.splits):
+        total_fail += 1
+        print("\nFAIL: no shards in any split")
     print("\nRESULT:", "PASS" if total_fail == 0 else f"FAIL ({total_fail} problems)")
     sys.exit(1 if total_fail else 0)
 

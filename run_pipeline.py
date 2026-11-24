@@ -7,7 +7,15 @@
              03 download/process (--cycle-clips)  →  04 VLM caption+QC  →  05 pack (--append --delete-processed)
          until the manifest is done or the disk floor is reached. Safe to stop and re-run at any time.
 
+  build  CPU machine, no GPU/VLM: repeated cycles of 03 → 05 (no captions) → verify → 06 push. Pulls the
+         layout file (02c) and manifest from the Hub repo's meta/ folder each cycle. Several machines:
+         --machine-shard i/N (disjoint videos, tagged shard names).
+  gpu    GPU machine: model server + 02c for all videos (pushes meta/layout_overrides.parquet every few
+         minutes for the build machines) + 07 caption pass over shards as they arrive on the Hub.
+
 Examples:
+  python run_pipeline.py gpu   --start-vlm-server --push-to-hub <user>/nitrogen-2d-wm
+  python run_pipeline.py build --push-to-hub <user>/nitrogen-2d-wm --workers 32 [--machine-shard 0/2]
   python run_pipeline.py smoke --proxy http://127.0.0.1:8899
   python run_pipeline.py bulk  --proxy http://127.0.0.1:8899 --workers 8 --min-free-gb 60
   python run_pipeline.py bulk  --dry-run                     # print the commands only
@@ -199,6 +207,143 @@ def resample(a, log):
     run([PY, "02_profile_and_sample.py", "--enrich-youtube", "--target-hours", "1e9", "--skip-profile"], log, a.dry_run)
 
 
+# ============================================================================ Hub meta sync (gpu <-> build)
+META_FILES = {"layout_overrides.parquet": DATA_ROOT / "layout_overrides.parquet",
+              "manifest_2d.parquet": DATA_ROOT / "manifest_2d.parquet"}
+
+
+def hub_push_meta(repo: str, names: list[str], log) -> None:
+    from huggingface_hub import CommitOperationAdd, HfApi
+    ops = [CommitOperationAdd(f"meta/{n}", str(META_FILES[n])) for n in names if META_FILES[n].exists()]
+    if not ops:
+        return
+    api = HfApi(token=os.environ.get("HF_TOKEN"))
+    api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
+    api.create_commit(repo, repo_type="dataset", operations=ops, commit_message="update " + ", ".join(names))
+    log.info("pushed %s to %s/meta", ", ".join(n for n in names if META_FILES[n].exists()), repo)
+
+
+def hub_pull_packed(repo: str, log) -> None:
+    """Every machine's packed-uuid lists (meta/packed/*.txt) -> webdataset/_hub_packed/, which stage 03 treats as
+    done, so no machine re-downloads a clip that is already in a shard on the Hub."""
+    from huggingface_hub import HfApi, hf_hub_download
+    try:
+        files = [f for f in HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(repo, repo_type="dataset")
+                 if f.startswith("meta/packed/") and f.endswith(".txt")]
+    except Exception as e:
+        log.warning("could not list %s (%s)", repo, type(e).__name__)
+        return
+    dst = DATA_ROOT / "webdataset" / "_hub_packed"
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        p = hf_hub_download(repo, f, repo_type="dataset", local_dir=DATA_ROOT / "hub_meta")
+        shutil.copy(p, dst / Path(f).name)
+    if files:
+        log.info("pulled %d packed-uuid lists from the Hub", len(files))
+
+
+def hub_pull_meta(repo: str, names: list[str], log) -> None:
+    from huggingface_hub import hf_hub_download
+    for n in names:
+        try:
+            p = hf_hub_download(repo, f"meta/{n}", repo_type="dataset", local_dir=DATA_ROOT / "hub_meta")
+        except Exception as e:  # not pushed yet: keep whatever is local
+            log.warning("could not pull meta/%s from %s (%s)", n, repo, type(e).__name__)
+            continue
+        dst = META_FILES[n]
+        if not dst.exists() or Path(p).read_bytes() != dst.read_bytes():
+            shutil.copy(p, dst)
+            log.info("updated %s from the Hub", dst.name)
+
+
+# ============================================================================ build (CPU) / gpu modes
+def build(a, log):
+    """CPU-only: download/process → pack without captions → push. Captions come later from 07 on a GPU box."""
+    if not a.push_to_hub:
+        raise StepFailed("build mode needs --push-to-hub REPO_ID (layout file comes from, and shards go to, the Hub)")
+    processed = DATA_ROOT / "processed"
+    require_js_runtime(a, log)
+    check_direct_access(a, log)
+    tag = a.machine_tag or (f"m{a.machine_shard.split('/')[0]}" if a.machine_shard else "")
+    shard_args = ["--shard", a.machine_shard] if a.machine_shard else []
+    idle, cycle = 0, 0
+    while True:
+        cycle += 1
+        log.info("════════ build cycle %d ════════", cycle)
+        if not a.dry_run:
+            hub_pull_meta(a.push_to_hub, ["manifest_2d.parquet", "layout_overrides.parquet"], log)
+            hub_pull_packed(a.push_to_hub, log)
+        before = count_clips(processed)
+        todo = max(0, a.cycle_clips - before)
+        if todo:
+            run([PY, "03_download_and_process.py", "--limit", str(todo), "--workers", str(a.workers),
+                 "--min-free-gb", str(a.min_free_gb), "--require-layout-check", "--hwaccel", "none",
+                 "--video-group-window", str(a.video_group_window),
+                 "--min-video-gameplay-frac", str(a.min_video_gameplay_frac), *shard_args, *bucket_args(a), *net_args(a)],
+                log, a.dry_run)
+        new = count_clips(processed)
+        if new or a.dry_run:
+            run([PY, "05_pack_webdataset.py", "--append", "--delete-processed", "--allow-missing-caption",
+                 "--min-gameplay-frac", "0", "--no-require-frame0-gameplay", *(["--tag", tag] if tag else [])],
+                log, a.dry_run)
+            run([PY, "verify_dataset.py", "--num-shards", "5", "--debug-videos", "0", "--allow-missing-caption", "--allow-missing-split",
+                 "--out-dir", str(DATA_ROOT / "debug" / f"build_{tag or 'm'}_{cycle:03d}")], log, a.dry_run)
+            run([PY, "06_push_to_hub.py", "--repo-id", a.push_to_hub, "--delete-local", *(["--tag", tag] if tag else [])],
+                log, a.dry_run)
+        run([PY, "03_download_and_process.py", "--status", *shard_args], log, a.dry_run)
+        if a.dry_run or (a.max_cycles and cycle >= a.max_cycles):
+            break
+        idle = idle + 1 if new == 0 else 0
+        if idle >= a.idle_cycles:
+            log.info("Nothing new for %d cycles: the manifest (with the current layout file) is done.", idle)
+            break
+        if new == 0:  # 02c may still be adding videos on the GPU box
+            log.info("No clips this cycle: waiting 10 min for more layout checks from the GPU box")
+            time.sleep(600)
+
+
+def gpu(a, log):
+    """Model server + 02c (layouts, pushed for the build machines) + 07 captions over shards on the Hub."""
+    if not a.push_to_hub:
+        raise StepFailed("gpu mode needs --push-to-hub REPO_ID")
+    if a.start_vlm_server:
+        start_vlm_server(a, log)
+    if not a.vlm_server and not a.dry_run:
+        raise StepFailed("gpu mode needs a model server: --start-vlm-server or --vlm-server URL")
+    if not a.dry_run:
+        hub_push_meta(a.push_to_hub, ["manifest_2d.parquet", "layout_overrides.parquet"], log)
+    procs = {}
+    if not a.skip_layout:
+        cmd = [PY, "02c_detect_layout.py", "--workers", str(a.workers), *layout_args(a), *net_args(a)]
+        log.info("▶ (background) %s", " ".join(cmd))
+        if not a.dry_run:
+            procs["02c"] = subprocess.Popen(cmd, cwd=HERE, stderr=subprocess.STDOUT,
+                                            stdout=open(DATA_ROOT / "logs" / "console_02c_detect_layout.log", "a"))
+    cmd = [PY, "07_caption_shards.py", "--repo-id", a.push_to_hub, "--follow", "--backend", "openai",
+           "--api-base", a.vlm_server or "http://localhost:8000/v1", "--model", a.vlm_model, *qc_args(a)]
+    log.info("▶ (background) %s", " ".join(cmd))
+    if a.dry_run:
+        return
+    procs["07"] = subprocess.Popen(cmd, cwd=HERE, stderr=subprocess.STDOUT,
+                                   stdout=open(DATA_ROOT / "logs" / "console_07_caption_shards.log", "a"))
+    for p in procs.values():
+        atexit.register(lambda p=p: p.poll() is None and p.terminate())
+    lo = META_FILES["layout_overrides.parquet"]
+    last = lo.stat().st_mtime if lo.exists() else 0
+    while any(p.poll() is None for p in procs.values()):
+        time.sleep(600)
+        if lo.exists() and lo.stat().st_mtime > last:  # share new layout checks with the build machines
+            last = lo.stat().st_mtime
+            try:
+                hub_push_meta(a.push_to_hub, ["layout_overrides.parquet"], log)
+            except Exception as e:
+                log.warning("layout push failed (will retry): %s", e)
+    if lo.exists() and lo.stat().st_mtime > last:
+        hub_push_meta(a.push_to_hub, ["layout_overrides.parquet"], log)
+    for name, p in procs.items():
+        log.info("%s exited with %s", name, p.returncode)
+
+
 # ============================================================================ smoke
 def smoke(a, log):
     root = DATA_ROOT / "smoke"
@@ -226,7 +371,7 @@ def smoke(a, log):
             run([PY, "02c_detect_layout.py", "--manifest", str(man), "--limit", str(max(40, 2 * a.clips)),
                  "--workers", str(a.workers), *layout_args(a), *net_args(a)], log, a.dry_run)
         run([PY, "03_download_and_process.py", "--manifest", str(man), "--processed-dir", str(processed),
-             "--tmp-dir", str(tmp), "--limit", str(a.clips), "--workers", str(a.workers),
+             "--tmp-dir", str(tmp), "--webdataset-dir", str(wds), "--limit", str(a.clips), "--workers", str(a.workers),
              "--require-layout-check", "--min-video-gameplay-frac", str(a.min_video_gameplay_frac), *bucket_args(a), *net_args(a)],
             log, a.dry_run)
         if not a.dry_run and count_clips(processed) == 0:
@@ -302,22 +447,28 @@ def bulk(a, log):
         before = count_clips(processed)
         require_proxy(a, log, wait=True)
         proxy_dropped = False
+        # clips already on disk (downloaded before a restart, not packed yet) count toward this cycle, so an
+        # interrupted cycle is finished and packed instead of growing by another --cycle-clips every restart
+        todo = max(0, a.cycle_clips - before)
+        if before:
+            log.info("%d unpacked clips from an earlier run on disk: downloading %d more this cycle", before, todo)
         try:
-            run([PY, "03_download_and_process.py", "--limit", str(a.cycle_clips), "--workers", str(a.workers),
-                 "--min-free-gb", str(a.min_free_gb), "--require-layout-check",
-                 "--min-video-gameplay-frac", str(a.min_video_gameplay_frac), *bucket_args(a), *net_args(a)], log, a.dry_run)
+            if todo:
+                run([PY, "03_download_and_process.py", "--limit", str(todo), "--workers", str(a.workers),
+                     "--min-free-gb", str(a.min_free_gb), "--require-layout-check",
+                     "--min-video-gameplay-frac", str(a.min_video_gameplay_frac), *bucket_args(a), *net_args(a)], log, a.dry_run)
         except StepFailed as e:
             if "exit 3" not in str(e):
                 raise
             log.warning("stage 03 stopped because the proxy went down; packing what we have, then waiting")
             proxy_dropped = True
-        new = count_clips(processed) - before
+        new = count_clips(processed) - before + (before if not todo else 0)  # resumed full cycle: pack it now
         log.info("cycle %d: %d new clips processed", cycle, new)
         if count_clips(processed) or a.dry_run:
             run([PY, "04_caption_frames.py", *qc_args(a), *vlm_args(a)], log, a.dry_run)
             run([PY, "05_pack_webdataset.py", "--append", "--delete-processed", *pack_args(a)], log, a.dry_run)
             if a.push_to_hub:  # check this cycle's shards before they leave the machine, then upload + free disk
-                run([PY, "verify_dataset.py", "--num-shards", "5", "--debug-videos", "0",
+                run([PY, "verify_dataset.py", "--num-shards", "5", "--debug-videos", "0", "--allow-missing-split",
                      "--out-dir", str(DATA_ROOT / "debug" / f"cycle_{cycle:03d}")], log, a.dry_run)
                 run([PY, "06_push_to_hub.py", "--repo-id", a.push_to_hub, "--delete-local"], log, a.dry_run)
         run([PY, "03_download_and_process.py", "--status"], log, a.dry_run)
@@ -337,12 +488,18 @@ def bulk(a, log):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["smoke", "bulk"])
+    ap.add_argument("mode", choices=["smoke", "bulk", "build", "gpu"])
     ap.add_argument("--proxy", default=None, help="e.g. http://127.0.0.1:8899 (passed to 02c and 03)")
     ap.add_argument("--cookies", default=None, help="default: repo www.youtube.com_cookies.txt if present")
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--workers", type=int, default=8, help="download/process threads (build: ~1 per vCPU)")
+    ap.add_argument("--machine-shard", default=None, help="build: i/N, this machine's disjoint share of the videos")
+    ap.add_argument("--machine-tag", default=None, help="build: tag in shard names (default m<i> with --machine-shard)")
+    ap.add_argument("--video-group-window", type=int, default=200000,
+                    help="build: process a video's chunks back to back within windows of N clips (fewer URL resolves)")
+    ap.add_argument("--idle-cycles", type=int, default=6, help="build: stop after N cycles in a row with nothing new")
     ap.add_argument("--clips", type=int, default=20, help="smoke: clips to process")
-    ap.add_argument("--cycle-clips", type=int, default=20000, help="bulk: clips per download/pack cycle (~110 h)")
+    ap.add_argument("--cycle-clips", type=int, default=8000,
+                    help="bulk: clips per download/caption/pack/push cycle (~44 h of video, ~3 h of downloading at ~45 clips/min)")
     ap.add_argument("--max-cycles", type=int, default=0, help="bulk: stop after N cycles (0 = until done)")
     ap.add_argument("--min-free-gb", type=float, default=60.0)
     ap.add_argument("--min-video-gameplay-frac", type=float, default=0.5)
@@ -370,7 +527,7 @@ def main():
     log = setup_logging("run_pipeline")
     log.info("NG_DATA_ROOT=%s mode=%s", DATA_ROOT, a.mode)
     try:
-        smoke(a, log) if a.mode == "smoke" else bulk(a, log)
+        {"smoke": smoke, "bulk": bulk, "build": build, "gpu": gpu}[a.mode](a, log)
     except StepFailed as e:
         log.error("%s\nEverything is resumable: fix the issue and re-run the same command.", e)
         sys.exit(1)

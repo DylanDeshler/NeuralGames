@@ -37,6 +37,7 @@ import os
 import re
 import logging
 import shutil
+import zlib
 import subprocess
 import threading
 import time
@@ -623,6 +624,9 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
         acts = pool_actions(actions, stride, n_out)
         assert acts.shape == (n_out, ACTION_DIM), acts.shape
         np.save(work / "actions.npy", acts.astype(np.float32))
+        # native-rate actions too (float16, n_ann x 21): overlay-vs-frame lag is often 1-3 native frames (capture /
+        # OBS latency), below one output frame, so pooled actions alone can't be re-aligned at training time
+        np.save(work / "actions_native.npy", np.asarray(actions[:n_out * stride], np.float16))
         orig = _jload(row.meta_json) or {}
         meta = {
             "uuid": row.uuid, "video_id": row.video_id, "chunk_id": int(row.chunk_id), "split": row.split,
@@ -648,7 +652,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
         atomic_write_json(work / "meta.json", meta)
         # move results into place; meta.json last so its presence means "complete"
         out_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("frames.mp4", "actions.npy", "frame0.png"):
+        for name in ("frames.mp4", "actions.npy", "actions_native.npy", "frame0.png"):
             os.replace(work / name, out_dir / name)
         os.replace(work / "meta.json", out_dir / "meta.json")
         src_actions.unlink(missing_ok=True)
@@ -699,6 +703,34 @@ def stage_actions(man: pd.DataFrame, args, log) -> None:
             d = processed_dir_for(args.processed_dir, vid_of[u], u)
             d.mkdir(parents=True, exist_ok=True)
             np.save(d / "_actions_src.npy", a)
+
+
+def backfill_native_actions(man: pd.DataFrame, args, log) -> None:
+    """Processed clips from before actions_native.npy existed: rebuild it from the stage-01 action files
+    (same chunk, first n_frames * frame_stride native frames), so they can be packed with it."""
+    need = []
+    for mp in Path(args.processed_dir).glob("*/*/meta.json"):
+        if not (mp.parent / "actions_native.npy").exists():
+            need.append(json.loads(mp.read_text()))
+    if not need:
+        log.info("backfill: every processed clip already has actions_native.npy")
+        return
+    by_uuid = {m["uuid"]: m for m in need}
+    sub = man[man.uuid.isin(by_uuid)]
+    n_ok = 0
+    for shard, sdf in tqdm(sub.groupby("shard"), desc="backfill native actions"):
+        t = ds.dataset(Path(args.meta_dir) / "actions" / f"SHARD_{int(shard):04d}.parquet").to_table(
+            columns=["uuid", "n_frames", "actions"], filter=pc.field("uuid").isin(sdf["uuid"].tolist()))
+        for u, n, b in zip(t.column("uuid").to_pylist(), t.column("n_frames").to_pylist(), t.column("actions").to_pylist()):
+            m = by_uuid[u]
+            a = np.frombuffer(b, np.float32).reshape(n, ACTION_DIM)[: int(m["n_frames"]) * int(m["frame_stride"])]
+            pooled = np.load(processed_dir_for(args.processed_dir, m["video_id"], u) / "actions.npy")
+            if np.abs(pool_actions(a, int(m["frame_stride"]), int(m["n_frames"])) - pooled).max() > 1e-4:
+                log.warning("backfill: %s native actions don't pool to the stored ones, skipped", u)
+                continue
+            np.save(processed_dir_for(args.processed_dir, m["video_id"], u) / "actions_native.npy", a.astype(np.float16))
+            n_ok += 1
+    log.info("backfill: wrote actions_native.npy for %d / %d clips", n_ok, len(need))
 
 
 def apply_layout_overrides(man: pd.DataFrame, args, log) -> pd.DataFrame:
@@ -778,8 +810,18 @@ def load_failed(path: Path) -> dict[str, dict]:
     return out
 
 
+def finished_uuids(args) -> set[str]:
+    """uuids stage 05 packed into shards or dropped (their processed dirs may be gone after --delete-processed)."""
+    out: set[str] = set()
+    root = Path(args.webdataset_dir)
+    for f in [*root.glob("*/_packed_uuids.txt"), *root.glob("*/_dropped_uuids.txt"), *root.glob("_hub_packed/*.txt")]:
+        out.update(f.read_text().split())
+    return out
+
+
 def print_status(man: pd.DataFrame, args) -> None:
-    done = np.array([(processed_dir_for(args.processed_dir, v, u) / "meta.json").exists()
+    finished = finished_uuids(args)
+    done = np.array([u in finished or (processed_dir_for(args.processed_dir, v, u) / "meta.json").exists()
                      for v, u in zip(man.video_id, man.uuid)])
     failed = load_failed(Path(args.processed_dir) / "_failed.jsonl")
     perm = man.uuid.map(lambda u: failed.get(u, {}).get("kind") == "permanent").to_numpy() & ~done
@@ -817,6 +859,7 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--max-starts-per-min", type=float, default=60.0,
                     help="max yt-dlp URL resolves per minute (one per video while cached; ffmpeg range fetches are not limited)")
+    ap.add_argument("--shard", default=None, help="i/N: process only videos with crc32(video_id) %% N == i (multi-machine)")
     ap.add_argument("--video-group-window", type=int, default=20000,
                     help="within each window of N clips (priority order), process a video's chunks back to back so one "
                          "URL resolve serves them all (0 = strict priority order)")
@@ -851,6 +894,10 @@ def main():
     ap.add_argument("--mask-dilate", type=int, default=2, help="mask dilation in output pixels")
     ap.add_argument("--inpaint-radius", type=float, default=3.0)
     ap.add_argument("--max-pad-frames", type=int, default=6, help="max tail frames to pad by repetition")
+    ap.add_argument("--webdataset-dir", default=str(DATA_ROOT / "webdataset"),
+                    help="stage 05 output: clips listed in its _packed_uuids.txt / _dropped_uuids.txt count as done")
+    ap.add_argument("--backfill-native", action="store_true",
+                    help="add actions_native.npy to already-processed clips from the stage-01 files, then exit")
     ap.add_argument("--hwaccel", choices=["auto", "cuda", "none"], default="auto",
                     help="decode on the GPU with NVDEC (auto = if ffmpeg has CUDA and nvidia-smi exists); falls back "
                          "to CPU after a failure")
@@ -897,6 +944,10 @@ def main():
     man = apply_layout_overrides(man, args, log)
     if args.split != "all":
         man = man[man.split == args.split]
+    if args.shard:  # several machines: each takes a disjoint, stable set of videos
+        i, n = (int(x) for x in args.shard.split("/"))
+        man = man[man.video_id.map(lambda v: zlib.crc32(str(v).encode()) % n == i)]
+        log.info("Machine shard %d/%d: %s chunks from %s videos", i, n, f"{len(man):,}", f"{man.video_id.nunique():,}")
     # interleave games so early progress covers many titles (and spreads load across videos)
     if "download_priority" in man.columns:
         # balanced-first order: any prefix of the run is a per-game-capped ("water-filling") subset
@@ -904,6 +955,9 @@ def main():
     else:
         man = man.sample(frac=1.0, random_state=0).reset_index(drop=True)
     Path(args.processed_dir).mkdir(parents=True, exist_ok=True)
+    if args.backfill_native:
+        backfill_native_actions(pd.read_parquet(args.manifest), args, log)
+        return
     if args.status:
         print_status(man, args)
         return
@@ -912,8 +966,13 @@ def main():
     Path(args.tmp_dir).mkdir(parents=True)
     failed_path = Path(args.processed_dir) / "_failed.jsonl"
     failed = load_failed(failed_path)
-    done_mask = np.array([(processed_dir_for(args.processed_dir, v, u) / "meta.json").exists()
+    # done = processed on disk, or already packed into shards / dropped by stage 05 (whose --delete-processed
+    # removed the clip dir): without the latter, every bulk cycle would re-download the previous cycles' clips
+    finished = finished_uuids(args)
+    done_mask = np.array([u in finished or (processed_dir_for(args.processed_dir, v, u) / "meta.json").exists()
                           for v, u in zip(man.video_id, man.uuid)])
+    if finished:
+        log.info("%s clips already packed or dropped by stage 05 (%s)", f"{len(finished):,}", args.webdataset_dir)
     todo = man[~done_mask]
     if not args.retry_failed:
         todo = todo[todo.uuid.map(lambda u: failed.get(u, {}).get("kind") != "permanent")]
@@ -922,8 +981,6 @@ def main():
         log.warning("Skipping %d chunks whose fps can't reach --target-fps %.0f with an integer stride: %s",
                     (~ok_fps).sum(), args.target_fps, todo.fps[~ok_fps].round().value_counts().to_dict())
         todo = todo[ok_fps]
-    if args.limit:
-        todo = todo.head(args.limit)
     if args.video_group_window > 0 and len(todo):
         # Balanced-first order puts a different video on almost every clip, so every clip paid a fresh yt-dlp
         # URL resolve (rate-limited, seconds each). Within each window of the priority order, process a video's
@@ -931,6 +988,9 @@ def main():
         todo = todo.reset_index(drop=True)
         todo["_win"] = np.arange(len(todo)) // args.video_group_window
         todo = todo.sort_values(["_win", "video_id", "chunk_id"]).drop(columns="_win").reset_index(drop=True)
+    if args.limit:  # after grouping: a cycle takes whole runs of a video's chunks, not one chunk from each of
+        todo = todo.head(args.limit)  # thousands of videos (every new video costs a rate-limited URL resolve)
+    if args.video_group_window > 0 and len(todo):
         log.info("Grouped by video within windows of %d: %s clips from %s videos (%.1f clips per URL resolve)",
                  args.video_group_window, f"{len(todo):,}", f"{todo.video_id.nunique():,}",
                  len(todo) / max(1, todo.video_id.nunique()))

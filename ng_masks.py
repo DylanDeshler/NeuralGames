@@ -117,3 +117,40 @@ def fit_to_canvas(frames: np.ndarray, valid: np.ndarray, W: int, H: int, max_cro
         out_f[:, y0:y0 + nh, x0:x0 + nw] = rf
         out_v[y0:y0 + nh, x0:x0 + nw] = rv
     return out_f, out_v
+
+
+# ----------------------------------------------------------------------------- action alignment (training side)
+# The NitroGen action labels are read from the on-screen controller overlay, which often leads or lags the
+# rendered game frame by 1-3 native (60 fps) frames (capture-card / OBS latency, constant per recording setup).
+# That is below one 15 fps output frame, so it can only be corrected from the native-rate actions stored in
+# each sample (`actions_native.npy`, (T * frame_stride, 21) float16). Two complementary fixes:
+#   1. realign_actions(native, stride, shift): re-pool with a shift of `shift` native frames;
+#   2. action_history(acts, k): condition step t on [a_{t-k+1}, ..., a_t] instead of a_t alone, so the model
+#      can absorb a small residual lag (k = 2-3 output frames covers +-1-3 native frames).
+
+def pool_native(native: np.ndarray, stride: int) -> np.ndarray:
+    """Same pooling as stage 03: sticks (first 4 dims) averaged, buttons (17) OR'd over each output frame."""
+    T = len(native) // stride
+    g = native[: T * stride].astype(np.float32).reshape(T, stride, native.shape[1])
+    return np.concatenate([g[:, :, :4].mean(1), g[:, :, 4:].max(1)], axis=1)
+
+
+def realign_actions(native: np.ndarray, stride: int, shift: int = 0) -> np.ndarray:
+    """(T, 21) actions re-pooled after shifting by `shift` native frames.
+
+    shift > 0 means the overlay LAGS the picture (an input shows up on the overlay `shift` frames after its
+    effect is visible): actions are moved earlier. Edges are padded by repeating the first/last frame, so the
+    output has the same length as the stored actions."""
+    a = native.astype(np.float32)
+    if shift > 0:
+        a = np.concatenate([a[shift:], np.repeat(a[-1:], shift, 0)])
+    elif shift < 0:
+        a = np.concatenate([np.repeat(a[:1], -shift, 0), a[:shift]])
+    return pool_native(a, stride)
+
+
+def action_history(acts: np.ndarray, k: int = 3) -> np.ndarray:
+    """(T, k * D): row t = [a_{t-k+1}, ..., a_t] (zeros before the clip start = "no input")."""
+    T, D = acts.shape
+    pad = np.concatenate([np.zeros((k - 1, D), acts.dtype), acts])
+    return np.concatenate([pad[i:i + T] for i in range(k)], axis=1)

@@ -54,6 +54,7 @@ def main():
     ap.add_argument("--public", action="store_true", help="create the repo PUBLIC (default: private)")
     ap.add_argument("--delete-local", action="store_true", help="delete shards after a verified upload")
     ap.add_argument("--revision", default="main")
+    ap.add_argument("--tag", default="", help="machine tag (multi-machine builds): index.json is uploaded as index_<tag>.json")
     args = ap.parse_args()
 
     from huggingface_hub import CommitOperationAdd, HfApi
@@ -70,10 +71,16 @@ def main():
     pushed = set(pushed_path.read_text().split()) if pushed_path.exists() else set()
     shards = sorted(p for p in root.glob("*/*/*.tar"))
     new = [p for p in shards if p.relative_to(root).as_posix() not in pushed]
-    meta_files = [p for p in [root / "game_ids.json", root / "name_mismatch_report.csv", *root.glob("*/index.json")]
+    meta_files = [p for p in [root / "game_ids.json", root / "name_mismatch_report.csv", *root.glob("*/index.json"),
+                              *root.glob("*/_packed_uuids.txt")]
                   if p.exists()]
     existing = set(api.list_repo_files(args.repo_id, repo_type="dataset", revision=args.revision))
-    ops = [CommitOperationAdd(p.relative_to(root).as_posix(), str(p)) for p in new + meta_files]
+    def remote_path(p: Path) -> str:  # each build machine's index goes to <split>/index_<tag>.json
+        rel = p.relative_to(root).as_posix()
+        if rel.endswith("/_packed_uuids.txt"):  # what this machine packed: other machines' stage 03 skips these
+            return f"meta/packed/{rel.split('/')[0]}_{args.tag or 'main'}.txt"
+        return rel.replace("/index.json", f"/index_{args.tag}.json") if args.tag and rel.endswith("/index.json") else rel
+    ops = [CommitOperationAdd(remote_path(p), str(p)) for p in new + meta_files]
     if "README.md" not in existing:
         ops.append(CommitOperationAdd("README.md", CARD.encode()))
     gb = sum(p.stat().st_size for p in new) / 1e9
