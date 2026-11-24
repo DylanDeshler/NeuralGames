@@ -42,9 +42,30 @@ NON_GAMEPLAY_BUTTONS = {"back", "start", "guide"}
 GAMEPLAY_BUTTON_IDX = [4 + i for i, b in enumerate(BUTTONS) if b not in NON_GAMEPLAY_BUTTONS]
 STICK_THRESHOLDS = (0.1, 0.2, 0.3)
 
-# Root for ALL pipeline outputs (metadata, manifests, clips, shards, caches, logs).
-# Set once:  export NG_DATA_ROOT=/data/games
-DATA_ROOT = Path(os.environ.get("NG_DATA_ROOT", "./data")).expanduser()
+# Root for ALL pipeline outputs (metadata, manifests, clips, shards, caches, logs). Every script REQUIRES
+# --data-root (alias --data), e.g. --data-root /data/games: no environment variable, no ./data fallback, so a
+# fresh shell after a reboot can't silently write somewhere else. It is read here, at import time, because the
+# scripts' argparse defaults (--manifest, --processed-dir, ...) are derived from it.
+def _data_root_from_argv() -> str | None:
+    argv = sys.argv[1:]
+    for i, x in enumerate(argv):
+        for flag in ("--data-root", "--data"):
+            if x == flag and i + 1 < len(argv):
+                return argv[i + 1]
+            if x.startswith(flag + "="):
+                return x.split("=", 1)[1]
+    return None
+
+
+_DATA_ROOT_ARG = _data_root_from_argv()
+# library use without the flag (e.g. imported from training code) gets ./data; pipeline scripts refuse to run
+DATA_ROOT = Path(_DATA_ROOT_ARG).expanduser().resolve() if _DATA_ROOT_ARG else Path("./data")
+
+
+def add_data_root_arg(ap) -> None:
+    """Required --data-root on every pipeline script (see DATA_ROOT above)."""
+    ap.add_argument("--data-root", "--data", dest="data_root", required=True, metavar="DIR",
+                    help="root for ALL outputs, e.g. /data/games (required; the shell environment is not used)")
 
 # YouTube cookies (throwaway account) checked into the repo root; used when --cookies isn't given.
 REPO_COOKIES = Path(__file__).resolve().parent / "www.youtube.com_cookies.txt"
@@ -69,8 +90,18 @@ def default_cookies(explicit: str | None = None) -> str | None:
         return str(dst)
     except OSError:
         return str(src)
-# Keep HF model/dataset caches (Qwen weights ~15-30 GB each) on the same disk unless HF_HOME is already set.
-os.environ.setdefault("HF_HOME", str(DATA_ROOT / "hf_cache"))
+# deno (yt-dlp's JS runtime) installs to ~/.deno/bin, which is only on PATH via ~/.bashrc: add it here so a fresh
+# shell after a reboot still finds it (yt-dlp and ffmpeg subprocesses inherit this PATH)
+_DENO_BIN = Path.home() / ".deno" / "bin"
+if _DENO_BIN.is_dir() and str(_DENO_BIN) not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = str(_DENO_BIN) + os.pathsep + os.environ.get("PATH", "")
+
+# Keep the big HF caches (Qwen weights ~15-30 GB, Xet chunks) on the data disk, but NOT via HF_HOME: HF_HOME
+# also moves the login token, so `hf auth login` (token in ~/.cache/huggingface) would look logged out here.
+# Same on-disk layout as before (<data-root>/hf_cache/hub), so already-downloaded weights are reused.
+if "HF_HOME" not in os.environ:
+    os.environ.setdefault("HF_HUB_CACHE", str(DATA_ROOT / "hf_cache" / "hub"))
+    os.environ.setdefault("HF_XET_CACHE", str(DATA_ROOT / "hf_cache" / "xet"))
 
 
 # ----------------------------------------------------------------------------- logging

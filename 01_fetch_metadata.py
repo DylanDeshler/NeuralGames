@@ -39,7 +39,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from ng_common import (
+from ng_common import (add_data_root_arg, 
     DATA_ROOT,
     ACTION_DIM, ACTION_NAMES, actions_to_array, activity_stats, atomic_write_json, detect_action_schema,
     dir_size_bytes, free_gb, human_bytes, parse_shard_spec, setup_logging,
@@ -312,6 +312,7 @@ def print_summary(out: Path, log) -> None:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     ap.add_argument("--repo-id", default=REPO_ID)
     ap.add_argument("--revision", default="main")
     ap.add_argument("--out", default=str(DATA_ROOT / "nitrogen_meta"))

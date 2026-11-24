@@ -52,7 +52,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 from tqdm import tqdm
 
-from ng_common import default_cookies, encode_native_actions, DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, free_gb, processed_dir_for, setup_logging
+from ng_common import add_data_root_arg, default_cookies, encode_native_actions, DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, free_gb, processed_dir_for, setup_logging
 
 PERMANENT_ERR = re.compile(
     r"(private video|video unavailable|video is unavailable|does not exist|has been removed|no longer available|account associated|"
@@ -850,6 +850,7 @@ def print_status(man: pd.DataFrame, args) -> None:
 # ============================================================================ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     ap.add_argument("--manifest", default=str(DATA_ROOT / "manifest_2d.parquet"))
     ap.add_argument("--meta-dir", default=str(DATA_ROOT / "nitrogen_meta"))
     ap.add_argument("--processed-dir", default=str(DATA_ROOT / "processed"))

@@ -40,7 +40,7 @@ import pandas as pd
 import pyarrow.dataset as ds
 from tqdm import tqdm
 
-from ng_common import DATA_ROOT, atomic_write_parquet, norm_title, setup_logging
+from ng_common import add_data_root_arg, DATA_ROOT, atomic_write_parquet, norm_title, setup_logging
 from ng_labels import BotBlockedError, GameLabeler, YouTubeMeta, video_urls
 
 PERSPECTIVES = ["side-view-2d", "top-down-2d", "isometric", "3d", "mixed", "unknown"]
@@ -264,6 +264,7 @@ class OpenAIText:
 # ============================================================================ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     ap.add_argument("--meta-dir", default=str(DATA_ROOT / "nitrogen_meta"))
     ap.add_argument("--genres", default="./config/genres_2d.yaml")
     ap.add_argument("--labels-csv", default="./config/game_labels.csv")

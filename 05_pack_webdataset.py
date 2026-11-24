@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from ng_common import DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, processed_dir_for, setup_logging
+from ng_common import add_data_root_arg, DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, processed_dir_for, setup_logging
 from ng_labels import GameLabeler
 
 
@@ -71,6 +71,7 @@ def name_check(man: pd.DataFrame, args, out: Path, log) -> set[str]:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     ap.add_argument("--manifest", default=str(DATA_ROOT / "manifest_2d.parquet"))
     ap.add_argument("--processed-dir", default=str(DATA_ROOT / "processed"))
     ap.add_argument("--out", default=str(DATA_ROOT / "webdataset"))

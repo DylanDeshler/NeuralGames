@@ -39,7 +39,7 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from ng_common import (default_cookies, DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, openai_chat_many, setup_logging, strip_thinking,
+from ng_common import (add_data_root_arg, default_cookies, DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, openai_chat_many, setup_logging, strip_thinking,
                        vllm_chat_kwargs, vllm_mm_kwargs)
 
 _spec = importlib.util.spec_from_file_location("stage03", Path(__file__).with_name("03_download_and_process.py"))
@@ -404,6 +404,7 @@ def aggregate(results: list[dict], full_thresh: float) -> dict:
 # ============================================================================ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     ap.add_argument("--manifest", default=str(DATA_ROOT / "manifest_2d.parquet"))
     ap.add_argument("--out", default=str(DATA_ROOT / "layout_overrides.parquet"))
     ap.add_argument("--tmp-dir", default=str(DATA_ROOT / "tmp_02c"))

@@ -26,7 +26,7 @@ import argparse
 import os
 from pathlib import Path
 
-from ng_common import DATA_ROOT, setup_logging
+from ng_common import add_data_root_arg, DATA_ROOT, setup_logging
 
 CARD = """---
 license: other
@@ -49,6 +49,7 @@ Each sample: `<uuid>.mp4` (15 fps, H.264 yuv444p), `.actions.npy` (T×21 float32
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     ap.add_argument("--repo-id", required=True, help="e.g. <your-username>/nitrogen-2d-wm")
     ap.add_argument("--root", default=str(DATA_ROOT / "webdataset"))
     ap.add_argument("--public", action="store_true", help="create the repo PUBLIC (default: private)")

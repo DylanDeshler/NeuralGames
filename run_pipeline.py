@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Run the download → process → QC → pack stages in order (02c, 03, 04, 05, verify).
 
-  smoke  ~20 clips end to end in an isolated $NG_DATA_ROOT/smoke/ (own manifest copy, processed dir, shards),
+  smoke  ~20 clips end to end in an isolated <data-root>/smoke/ (own manifest copy, processed dir, shards),
          then bundles the debug grids/videos + inspect report into smoke/smoke_results.tgz.
   bulk   02c layout detection for all videos (resumable), then repeated cycles of
              03 download/process (--cycle-clips)  →  04 VLM caption+QC  →  05 pack (--append --delete-processed)
@@ -14,11 +14,11 @@
          minutes for the build machines) + 07 caption pass over shards as they arrive on the Hub.
 
 Examples:
-  python run_pipeline.py gpu   --start-vlm-server --push-to-hub <user>/nitrogen-2d-wm
-  python run_pipeline.py build --push-to-hub <user>/nitrogen-2d-wm --workers 32 [--machine-shard 0/2]
-  python run_pipeline.py smoke --proxy http://127.0.0.1:8899
-  python run_pipeline.py bulk  --proxy http://127.0.0.1:8899 --workers 8 --min-free-gb 60
-  python run_pipeline.py bulk  --dry-run                     # print the commands only
+  python run_pipeline.py --data-root /data/games gpu   --start-vlm-server --push-to-hub <user>/nitrogen-2d-wm
+  python run_pipeline.py --data-root /data/games build --push-to-hub <user>/nitrogen-2d-wm --workers 32 [--machine-shard 0/2]
+  python run_pipeline.py --data-root /data/games smoke --proxy http://127.0.0.1:8899
+  python run_pipeline.py --data-root /data/games bulk  --proxy http://127.0.0.1:8899 --workers 8 --min-free-gb 60
+  python run_pipeline.py --data-root /data/games bulk  --dry-run                     # print the commands only
 
 Stages 01, 02b and 02 (metadata, LLM labels, manifest) are run separately; pass --resample to re-run stage 02
 (re-sample everything, balanced-first order) before starting.
@@ -38,7 +38,7 @@ import json
 import os
 import urllib.request
 
-from ng_common import DATA_ROOT, DEFAULT_VLM, REPO_COOKIES, setup_logging
+from ng_common import add_data_root_arg, DATA_ROOT, DEFAULT_VLM, REPO_COOKIES, setup_logging
 
 HERE = Path(__file__).resolve().parent
 PY = sys.executable
@@ -48,7 +48,15 @@ class StepFailed(RuntimeError):
     pass
 
 
+def with_root(cmd: list[str]) -> list[str]:
+    """Every pipeline script requires --data-root: pass this run's root explicitly (never via the environment)."""
+    if len(cmd) > 1 and cmd[0] == PY and cmd[1].endswith(".py") and "--data-root" not in cmd:
+        return [cmd[0], cmd[1], "--data-root", str(DATA_ROOT), *cmd[2:]]
+    return cmd
+
+
 def run(cmd: list[str], log, dry: bool, stdout_path: Path | None = None) -> None:
+    cmd = with_root(cmd)
     pretty = " ".join(shlex.quote(c) for c in cmd)
     log.info("▶ %s", pretty)
     if dry:
@@ -178,7 +186,7 @@ def check_direct_access(a, log) -> None:
         raise StepFailed(f"--cookies {a.cookies} does not exist")
     if not a.cookies:
         if REPO_COOKIES.is_file():
-            log.info("Using repo cookies %s (stages copy it to $NG_DATA_ROOT/cookies_runtime.txt)", REPO_COOKIES.name)
+            log.info("Using repo cookies %s (stages copy it to <data-root>/cookies_runtime.txt)", REPO_COOKIES.name)
         else:
             log.warning("No --proxy and no cookies (--cookies or %s): YouTube usually bot-blocks datacenter IPs. "
                         "See README 'Cloud access with cookies' / tools/setup_youtube_access.sh.", REPO_COOKIES.name)
@@ -214,6 +222,21 @@ def resample(a, log):
 # ============================================================================ Hub meta sync (gpu <-> build)
 META_FILES = {"layout_overrides.parquet": DATA_ROOT / "layout_overrides.parquet",
               "manifest_2d.parquet": DATA_ROOT / "manifest_2d.parquet"}
+
+
+def require_hub_write(repo: str, log) -> None:
+    """Fail in seconds (not after a 5-min model-server start) if we can't write to the Hub repo."""
+    from huggingface_hub import HfApi
+    try:
+        who = HfApi(token=os.environ.get("HF_TOKEN")).whoami()
+    except Exception as e:
+        raise StepFailed(f"Not logged in to Hugging Face ({type(e).__name__}). Run `hf auth login` with a WRITE token "
+                         f"(or check that a stale HF_TOKEN variable isn't set).")
+    name = who.get("name")
+    orgs = {o.get("name") for o in who.get("orgs", [])}
+    if repo.split("/")[0] not in {name} | orgs:
+        raise StepFailed(f"Logged in to Hugging Face as {name!r}, which can't create {repo!r}")
+    log.info("Hugging Face: logged in as %s", name)
 
 
 def hub_push_meta(repo: str, names: list[str], log) -> None:
@@ -265,6 +288,8 @@ def build(a, log):
     """CPU-only: download/process → pack without captions → push. Captions come later from 07 on a GPU box."""
     if not a.push_to_hub:
         raise StepFailed("build mode needs --push-to-hub REPO_ID (layout file comes from, and shards go to, the Hub)")
+    if not a.dry_run:
+        require_hub_write(a.push_to_hub, log)
     processed = DATA_ROOT / "processed"
     require_js_runtime(a, log)
     check_direct_access(a, log)
@@ -310,6 +335,8 @@ def gpu(a, log):
     """Model server + 02c (layouts, pushed for the build machines) + 07 captions over shards on the Hub."""
     if not a.push_to_hub:
         raise StepFailed("gpu mode needs --push-to-hub REPO_ID")
+    if not a.dry_run:
+        require_hub_write(a.push_to_hub, log)
     if a.start_vlm_server:
         start_vlm_server(a, log)
     if not a.vlm_server and not a.dry_run:
@@ -319,16 +346,16 @@ def gpu(a, log):
     procs = {}
     if not a.skip_layout:
         cmd = [PY, "02c_detect_layout.py", "--workers", str(a.workers), *layout_args(a), *net_args(a)]
-        log.info("▶ (background) %s", " ".join(cmd))
+        log.info("▶ (background) %s", " ".join(with_root(cmd)))
         if not a.dry_run:
-            procs["02c"] = subprocess.Popen(cmd, cwd=HERE, stderr=subprocess.STDOUT,
+            procs["02c"] = subprocess.Popen(with_root(cmd), cwd=HERE, stderr=subprocess.STDOUT,
                                             stdout=open(DATA_ROOT / "logs" / "console_02c_detect_layout.log", "a"))
     cmd = [PY, "07_caption_shards.py", "--repo-id", a.push_to_hub, "--follow", "--backend", "openai",
            "--api-base", a.vlm_server or "http://localhost:8000/v1", "--model", a.vlm_model, *qc_args(a)]
-    log.info("▶ (background) %s", " ".join(cmd))
+    log.info("▶ (background) %s", " ".join(with_root(cmd)))
     if a.dry_run:
         return
-    procs["07"] = subprocess.Popen(cmd, cwd=HERE, stderr=subprocess.STDOUT,
+    procs["07"] = subprocess.Popen(with_root(cmd), cwd=HERE, stderr=subprocess.STDOUT,
                                    stdout=open(DATA_ROOT / "logs" / "console_07_caption_shards.log", "a"))
     for p in procs.values():
         atexit.register(lambda p=p: p.poll() is None and p.terminate())
@@ -402,7 +429,7 @@ def bundle_smoke(root: Path, man: Path, processed: Path, wds: Path, debug: Path,
     """Always produce smoke_results.tgz: debug grids/videos, verify/inspect reports and every stage's log."""
     debug.mkdir(parents=True, exist_ok=True)
     try:
-        subprocess.run([PY, "inspect_clips.py", "--processed-dir", str(processed), "--manifest", str(man)],
+        subprocess.run(with_root([PY, "inspect_clips.py", "--processed-dir", str(processed), "--manifest", str(man)]),
                        cwd=HERE, stdout=open(debug / "inspect.txt", "w"), stderr=subprocess.STDOUT, timeout=600)
     except Exception as e:
         log.warning("inspect_clips failed: %s", e)
@@ -427,6 +454,8 @@ def bundle_smoke(root: Path, man: Path, processed: Path, wds: Path, debug: Path,
 # ============================================================================ bulk
 def bulk(a, log):
     processed = DATA_ROOT / "processed"
+    if a.push_to_hub and not a.dry_run:
+        require_hub_write(a.push_to_hub, log)
     if a.resample:
         resample(a, log)
     require_js_runtime(a, log)
@@ -438,8 +467,8 @@ def bulk(a, log):
         require_proxy(a, log, wait=True)
         cmd = [PY, "02c_detect_layout.py", "--workers", str(a.workers), *layout_args(a), *net_args(a)]
         if a.vlm_server and not a.dry_run:  # shared server: check layouts in the background while downloading
-            log.info("▶ (background) %s  -> logs/console_02c_detect_layout.log", " ".join(cmd))
-            bg02c = subprocess.Popen(cmd, cwd=HERE, stdout=open(DATA_ROOT / "logs" / "console_02c_detect_layout.log", "a"),
+            log.info("▶ (background) %s  -> logs/console_02c_detect_layout.log", " ".join(with_root(cmd)))
+            bg02c = subprocess.Popen(with_root(cmd), cwd=HERE, stdout=open(DATA_ROOT / "logs" / "console_02c_detect_layout.log", "a"),
                                      stderr=subprocess.STDOUT)
             atexit.register(lambda: bg02c.poll() is None and bg02c.terminate())
         else:
@@ -492,6 +521,7 @@ def bulk(a, log):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     ap.add_argument("mode", choices=["smoke", "bulk", "build", "gpu"])
     ap.add_argument("--proxy", default=None, help="e.g. http://127.0.0.1:8899 (passed to 02c and 03)")
     ap.add_argument("--cookies", default=None, help="default: repo www.youtube.com_cookies.txt if present")
@@ -530,7 +560,7 @@ def main():
                          "them locally (disk then only holds one cycle)")
     a = ap.parse_args()
     log = setup_logging("run_pipeline")
-    log.info("NG_DATA_ROOT=%s mode=%s", DATA_ROOT, a.mode)
+    log.info("data root=%s mode=%s", DATA_ROOT, a.mode)
     try:
         {"smoke": smoke, "bulk": bulk, "build": build, "gpu": gpu}[a.mode](a, log)
     except StepFailed as e:

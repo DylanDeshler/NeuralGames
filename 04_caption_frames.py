@@ -38,7 +38,7 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from ng_common import (DATA_ROOT, DEFAULT_VLM, atomic_write_json, atomic_write_parquet, openai_chat_many,
+from ng_common import (add_data_root_arg, DATA_ROOT, DEFAULT_VLM, atomic_write_json, atomic_write_parquet, openai_chat_many,
                        processed_dir_for, setup_logging, strip_thinking, vllm_chat_kwargs, vllm_mm_kwargs)
 
 DEFAULT_MODEL = DEFAULT_VLM
@@ -224,6 +224,7 @@ def merge_into_manifest(manifest_path: str, processed_dir: str, log) -> None:
 # ============================================================================ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     ap.add_argument("--manifest", default=str(DATA_ROOT / "manifest_2d.parquet"))
     ap.add_argument("--processed-dir", default=str(DATA_ROOT / "processed"))
     ap.add_argument("--backend", choices=["vllm", "transformers", "openai"], default="vllm")

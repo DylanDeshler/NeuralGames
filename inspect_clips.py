@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from ng_common import DATA_ROOT
+from ng_common import add_data_root_arg, DATA_ROOT
 
 
 def short(x, n=70):
@@ -22,6 +22,7 @@ def short(x, n=70):
 
 def main():
     ap = argparse.ArgumentParser()
+    add_data_root_arg(ap)
     ap.add_argument("--processed-dir", default=str(DATA_ROOT / "processed"))
     ap.add_argument("--manifest", default=str(DATA_ROOT / "manifest_2d.parquet"))
     ap.add_argument("--layout", default=str(DATA_ROOT / "layout_overrides.parquet"))

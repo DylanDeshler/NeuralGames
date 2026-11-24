@@ -40,7 +40,7 @@ import pyarrow.dataset as ds
 from scipy.optimize import brentq
 from tqdm import tqdm
 
-from ng_common import DATA_ROOT, ACTION_DIM, STICK_THRESHOLDS, atomic_write_parquet, setup_logging
+from ng_common import add_data_root_arg, DATA_ROOT, ACTION_DIM, STICK_THRESHOLDS, atomic_write_parquet, setup_logging
 from ng_labels import BotBlockedError, GameLabeler, YouTubeMeta, video_urls
 
 LIGHT_COLS = ["uuid", "shard", "video_id", "chunk_id", "game", "duration", "n_frames", "fps",
@@ -403,6 +403,7 @@ def recompute_activity(df: pd.DataFrame, meta_dir: Path, thresh: float, include_
 # ============================================================================ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     ap.add_argument("--meta-dir", default=str(DATA_ROOT / "nitrogen_meta"))
     ap.add_argument("--genres", default="./config/genres_2d.yaml")
     ap.add_argument("--labels-csv", default="./config/game_labels.csv",

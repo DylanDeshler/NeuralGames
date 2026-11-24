@@ -49,14 +49,17 @@ curl -fsSL https://deno.land/install.sh | sh # JS runtime yt-dlp needs for YouTu
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt               # drop vllm/transformers lines if captioning elsewhere
 huggingface-cli login                         # optional (dataset is public; avoids rate limits)
-export NG_DATA_ROOT=/data/games               # where ALL outputs go (default: ./data). Add to ~/.bashrc
 ```
 
-Everything lands under `$NG_DATA_ROOT`. The Hugging Face cache (`HF_HOME`) also defaults to
-`$NG_DATA_ROOT/hf_cache` unless you've already set it, so the Qwen weights stay off your home disk.
+**Every script requires `--data-root DIR` (alias `--data`), e.g. `--data-root /data/games`.** Everything
+lands under it. There is deliberately no environment variable and no `./data` fallback: machines that reboot
+daily lose shell settings, and a silent fallback would scatter outputs. `run_pipeline.py` passes its
+`--data-root` on to every stage. The Hugging Face caches (`HF_HUB_CACHE`, `HF_XET_CACHE`) default to
+`<data-root>/hf_cache/` unless you've set `HF_HOME`, so the Qwen weights stay off your home disk. Your
+`hf auth login` token stays in `~/.cache/huggingface`.
 
 ```
-$NG_DATA_ROOT/
+<data-root>/
   nitrogen_meta/{index,actions,_done,_tars}/   stage 01 (~60 GB; _tars is scratch, ~2 GB per worker)
   yt_meta_cache.jsonl  llm_game_labels.parquet  stage 02b / 02
   manifest_2d.parquet  reports/                 stage 02
@@ -88,7 +91,7 @@ YouTube often answers datacenter IPs with "Sign in to confirm you're not a bot".
      `yt-dlp --cookies-from-browser firefox --cookies cookies.txt --skip-download "https://youtu.be/BaW_jenozKc"`.
   3. Save them as `www.youtube.com_cookies.txt` in the repo root and commit them, then `git pull` on the GPU box.
      Every stage uses that file automatically when `--cookies` isn't given. yt-dlp works on a copy at
-     `$NG_DATA_ROOT/cookies_runtime.txt`, so the tracked file doesn't change.
+     `<data-root>/cookies_runtime.txt`, so the tracked file doesn't change.
   4. On the box, run `bash tools/setup_youtube_access.sh`. It installs deno, `yt-dlp[default]` and the
      bgutil PO-token plugin, starts the provider on 127.0.0.1:4416 (Docker, or a Node build if Docker is
      missing), and checks that you get a PO token and an unthrottled download.
@@ -100,8 +103,8 @@ YouTube often answers datacenter IPs with "Sign in to confirm you're not a bot".
 ## One command: `run_pipeline.py`
 After stages 01, 02b and 02 (metadata, LLM labels, manifest), the download/processing stages run together:
 ```bash
-python run_pipeline.py smoke --proxy http://127.0.0.1:8899     # ~20 clips in $NG_DATA_ROOT/smoke/, ends with smoke_results.tgz
-python run_pipeline.py bulk  --proxy http://127.0.0.1:8899 --workers 8 --min-free-gb 60
+python run_pipeline.py --data-root /data/games smoke --proxy http://127.0.0.1:8899     # ~20 clips in <data-root>/smoke/, ends with smoke_results.tgz
+python run_pipeline.py --data-root /data/games bulk  --proxy http://127.0.0.1:8899 --workers 8 --min-free-gb 60
 ```
 * **smoke** uses an isolated copy of the manifest and its own processed/shard dirs, so it never touches
   bulk outputs. It runs 02c (first 40 videos) → 03 (`--clips 20`) → 04 → 05 → verify → inspect, then
@@ -129,15 +132,15 @@ GPU box has few CPUs. So the work is split:
 
 ```bash
 # GPU box
-python run_pipeline.py gpu --start-vlm-server --push-to-hub <user>/nitrogen-2d-wm
+python run_pipeline.py --data-root /data/games gpu --start-vlm-server --push-to-hub <user>/nitrogen-2d-wm
 # CPU box (one machine)
-python run_pipeline.py build --push-to-hub <user>/nitrogen-2d-wm --workers 32
+python run_pipeline.py --data-root /data/games build --push-to-hub <user>/nitrogen-2d-wm --workers 32
 # or two CPU machines: disjoint videos, shard names tagged m0 / m1
-python run_pipeline.py build --push-to-hub <user>/nitrogen-2d-wm --workers 32 --machine-shard 0/2
-python run_pipeline.py build --push-to-hub <user>/nitrogen-2d-wm --workers 32 --machine-shard 1/2
+python run_pipeline.py --data-root /data/games build --push-to-hub <user>/nitrogen-2d-wm --workers 32 --machine-shard 0/2
+python run_pipeline.py --data-root /data/games build --push-to-hub <user>/nitrogen-2d-wm --workers 32 --machine-shard 1/2
 ```
 CPU box setup: `pip install -r requirements.txt` (vLLM/torch lines not needed), ffmpeg, `bash
-tools/setup_youtube_access.sh`, and the stage-01 action files at `$NG_DATA_ROOT/nitrogen_meta/actions/`
+tools/setup_youtube_access.sh`, and the stage-01 action files at `<data-root>/nitrogen_meta/actions/`
 (`rsync -a gpu:/data/games/nitrogen_meta/ /data/games/nitrogen_meta/`, or re-run `01_fetch_metadata.py`).
 Use one throwaway YouTube account per machine. Build machines only process videos 02c has already checked,
 and they pick up new ones each cycle. Each machine pushes its packed-uuid list to `meta/packed/`, and stage 03
@@ -158,9 +161,9 @@ keep = dict(zip(cap.uuid, cap.caption))          # in the WebDataset pipeline: s
 
 ### 1. Metadata sync
 ```bash
-python 01_fetch_metadata.py --shards 0-1          # try 2 shards first (~3.5 GB download, a few min)
-python 01_fetch_metadata.py --shards all --workers 4
-python 01_fetch_metadata.py --summary-only        # re-print the summary
+python 01_fetch_metadata.py --data-root /data/games --shards 0-1          # try 2 shards first (~3.5 GB download, a few min)
+python 01_fetch_metadata.py --data-root /data/games --shards all --workers 4
+python 01_fetch_metadata.py --data-root /data/games --summary-only        # re-print the summary
 ```
 Writes `data/nitrogen_meta/{index,actions}/SHARD_XXXX.parquet`. Tarballs are deleted after
 processing unless you pass `--keep-tar`. Check the log for the detected parquet schema and an example
@@ -169,7 +172,7 @@ processing unless you pass `--keep-tar`. Check the log for the detected parquet 
 
 ### 2a. (Recommended) LLM game identification
 ```bash
-python 02b_llm_label_games.py                       # vLLM + Qwen/Qwen3.8-27B-FP8 (thinking disabled), one 48 GB GPU
+python 02b_llm_label_games.py --data-root /data/games                       # vLLM + Qwen/Qwen3.8-27B-FP8 (thinking disabled), one 48 GB GPU
 ```
 For every video whose slug is `"other"` or unrecognised (including chapter names like
 `profaned_capital`), this fetches the YouTube title, channel, tags and description, reusing the cache
@@ -188,9 +191,9 @@ can't straddle the train/val split.
 ### 2. Profile, filter, sample
 ```bash
 # (a) measure: full 2D pool, idle-filter sensitivity, allocation options. Writes reports, no manifest.
-python 02_profile_and_sample.py --enrich-youtube --check-availability --plan
+python 02_profile_and_sample.py --data-root /data/games --enrich-youtube --check-availability --plan
 # (b) decide: pick a total and a strategy from the plan table, then write the manifest
-python 02_profile_and_sample.py --target-hours 5000 --allocation power      # or --allocation cap, or --alpha 0.8
+python 02_profile_and_sample.py --data-root /data/games --target-hours 5000 --allocation power      # or --allocation cap, or --alpha 0.8
 ```
 The plan prints, for each target in `--plan-targets` (default 250 h to 20k h, plus "everything"):
 
@@ -247,8 +250,8 @@ bbox coordinates in JSON format"): the game screen, every livestream element (ch
 Overlays that touch an edge and span most of the frame (chat columns, status bars, bezels) are **cropped
 off**; smaller ones inside the picture (webcams) are inpainted. Stage 03 crops to metadata area ∩ 02c area.
 ```bash
-python 02c_detect_layout.py --proxy http://127.0.0.1:8899 --limit 50   # check the summary line, then run without --limit
-python 03_download_and_process.py --proxy http://127.0.0.1:8899 --require-layout-check ...
+python 02c_detect_layout.py --data-root /data/games --proxy http://127.0.0.1:8899 --limit 50   # check the summary line, then run without --limit
+python 03_download_and_process.py --data-root /data/games --proxy http://127.0.0.1:8899 --require-layout-check ...
 ```
 `--require-layout-check` makes stage 03 skip videos 02c hasn't checked yet, so no chat or webcam layouts
 slip in. `--min-video-gameplay-frac 0.5` additionally skips videos whose probe frames were mostly menus, and
@@ -257,9 +260,9 @@ Stage 05 also drops individual clips that stage 04 judged 3D (`--drop-vlm-3d`, o
 
 ### 3. Download + process clips
 ```bash
-python 03_download_and_process.py --limit 20 --workers 4      # smoke test, then inspect data/processed
-python 03_download_and_process.py --workers 16 --max-starts-per-min 40
-python 03_download_and_process.py --status
+python 03_download_and_process.py --data-root /data/games --limit 20 --workers 4      # smoke test, then inspect data/processed
+python 03_download_and_process.py --data-root /data/games --workers 16 --max-starts-per-min 40
+python 03_download_and_process.py --data-root /data/games --status
 ```
 * `--method auto` (default): yt-dlp resolves the stream URL, then ffmpeg seeks with HTTP range
   requests and decodes only [start, end). If that fails, it falls back to
@@ -319,15 +322,15 @@ python 03_download_and_process.py --status
   pip install proxy.py && proxy --hostname 127.0.0.1 --port 8899
   ssh -N -o ServerAliveInterval=30 -R 8899:127.0.0.1:8899 user@cloud-box
   # cloud box
-  python 03_download_and_process.py --proxy http://127.0.0.1:8899 --workers 8
+  python 03_download_and_process.py --data-root /data/games --proxy http://127.0.0.1:8899 --workers 8
   ```
   An HTTP proxy works for both yt-dlp and ffmpeg's stream fetch. Stream URLs are tied to the IP that
   resolved them, so both must go through the same proxy. Throughput is bounded by the home connection.
 
 ### 4. VLM pass per clip: caption, gameplay QC, title check
 ```bash
-python 04_caption_frames.py --backend vllm                 # 4 frames per clip by default (--qc-frames)
-# multi-GPU: CUDA_VISIBLE_DEVICES=i python 04_caption_frames.py --num-shards N --shard-index i, then --merge-only
+python 04_caption_frames.py --data-root /data/games --backend vllm                 # 4 frames per clip by default (--qc-frames)
+# multi-GPU: CUDA_VISIBLE_DEVICES=i python 04_caption_frames.py --data-root /data/games --num-shards N --shard-index i, then --merge-only
 ```
 One request per clip shows the VLM (default Qwen3.8-27B FP8) 4 frames (start, 1/3, 2/3, end) and returns:
 * `caption` for frame 0 (art style, perspective, biome, main character; no HUD, text or game name);
@@ -342,8 +345,8 @@ and it can run while stage 03 is still downloading.
 
 ### 5. Pack + verify
 ```bash
-python 05_pack_webdataset.py                        # ~1 GB shards in data/webdataset/{train,val_unseen_games}
-python verify_dataset.py --num-shards 3 --debug-videos 2
+python 05_pack_webdataset.py --data-root /data/games                        # ~1 GB shards in data/webdataset/{train,val_unseen_games}
+python verify_dataset.py --data-root /data/games --num-shards 3 --debug-videos 2
 ```
 Stage 05 also drops clips with `vlm_frac_gameplay < --min-gameplay-frac` (0.75), clips with more than
 25 % near-black frames (`--max-black-frac`) and, with `--val-leak-check` (default), **val_unseen_games
@@ -408,7 +411,7 @@ from `actions_native.npy`. Two fixes, which combine:
   estimate, e.g. the shift that best lines up button onsets with motion onsets.
 
 Clips processed before native actions were stored can get them from the stage-01 files:
-`python 03_download_and_process.py --backfill-native` (checks that they pool to the stored actions).
+`python 03_download_and_process.py --data-root /data/games --backfill-native` (checks that they pool to the stored actions).
 
 ## Known limitations
 * Labels are per video, but some streams contain several games (e.g. "SotN randomizer, then

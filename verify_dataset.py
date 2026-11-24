@@ -33,7 +33,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ng_common import DATA_ROOT, ACTION_DIM, BUTTONS
+from ng_common import add_data_root_arg, DATA_ROOT, ACTION_DIM, BUTTONS
 
 BTN_ABBR = ["Dd", "Dl", "Dr", "Du", "LB", "LS", "LT", "RB", "RS", "RT", "A", "X", "B", "Y", "Bk", "St", "G"]
 
@@ -191,6 +191,7 @@ def make_debug_video(it: dict, path: Path) -> None:
 # ============================================================================ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     ap.add_argument("--root", default=str(DATA_ROOT / "webdataset"))
     ap.add_argument("--splits", nargs="+", default=["train", "val_unseen_games"])
     ap.add_argument("--num-shards", type=int, default=3, help="random shards per split to check")

@@ -19,8 +19,8 @@ polling for new shards while the build machines push, and exits after --idle-exi
 
   # GPU box (model server shared with 02c):
   vllm serve Qwen/Qwen3.8-27B-FP8 --limit-mm-per-prompt '{"image": 6}' &
-  python 07_caption_shards.py --repo-id <user>/nitrogen-2d-wm --follow
-  # local (smoke): python 07_caption_shards.py --local-root $NG_DATA_ROOT/smoke/webdataset
+  python 07_caption_shards.py --data-root /data/games --repo-id <user>/nitrogen-2d-wm --follow
+  # local (smoke): python 07_caption_shards.py --data-root /data/games --local-root /data/games/smoke/webdataset
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from ng_common import DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, setup_logging
+from ng_common import add_data_root_arg, DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, setup_logging
 
 cap04 = importlib.import_module("04_caption_frames")  # prompt, parser, image prep and VLM backends
 
@@ -145,6 +145,7 @@ class DummyBackend:
 # ============================================================================ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_data_root_arg(ap)
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--repo-id", help="Hub dataset with the shards; captions are committed back to it")
     src.add_argument("--local-root", help="local webdataset dir instead of the Hub")
