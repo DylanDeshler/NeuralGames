@@ -241,6 +241,8 @@ def require_hub_write(repo: str, log) -> None:
 
 def hub_push_meta(repo: str, names: list[str], log) -> None:
     from huggingface_hub import CommitOperationAdd, HfApi
+    from huggingface_hub.utils import disable_progress_bars
+    disable_progress_bars()
     ops = [CommitOperationAdd(f"meta/{n}", str(META_FILES[n])) for n in names if META_FILES[n].exists()]
     if not ops:
         return
@@ -331,6 +333,54 @@ def build(a, log):
             time.sleep(600)
 
 
+def pd_read(path, columns=None):
+    import pandas as pd
+    return pd.read_parquet(path, columns=columns)
+
+
+def layout_count(lo: Path) -> int:
+    try:
+        return len(pd_read(lo, ["video_id"])) if lo.exists() else 0
+    except Exception:  # being rewritten right now
+        return -1
+
+
+def caption_progress() -> tuple[int, int, str]:
+    """(shards, clips, last rate) from 07's log."""
+    p = DATA_ROOT / "logs" / "07_caption_shards.log"
+    shards = clips = 0
+    rate = "-"
+    if p.exists():
+        for line in p.read_text(errors="replace").splitlines():
+            if " clips in " in line and "clips/s" in line:
+                shards += 1
+                try:
+                    clips += int(line.split(": ")[-1].split(" clips in ")[0].split()[-1])
+                    rate = line.split("(")[1].split(")")[0]
+                except (IndexError, ValueError):
+                    pass
+    return shards, clips, rate
+
+
+def gpu_status(log, procs: dict, lo: Path, n_videos, n0: int, t_start: float, server: str | None) -> None:
+    n = layout_count(lo)
+    parts = []
+    if "02c" in procs:
+        if n >= 0 and n_videos:
+            rate = (n - n0) / max(1e-6, (time.time() - t_start) / 3600)
+            eta = (n_videos - n) / rate if rate > 0 else float("inf")
+            parts.append(f"02c {n:,}/{n_videos:,} videos ({100 * n / n_videos:.0f}%), {rate:.0f}/h, ETA "
+                         + (f"{eta:.1f} h" if eta != float("inf") else "?")
+                         + ("" if procs["02c"].poll() is None else f" [exited {procs['02c'].returncode}]"))
+        else:
+            parts.append(f"02c {max(n, 0):,} videos")
+    sh, cl, r = caption_progress()
+    parts.append(f"captions {sh} shards / {cl:,} clips (last {r})"
+                 + ("" if procs["07"].poll() is None else f" [exited {procs['07'].returncode}]"))
+    parts.append("server " + ("up" if server and server_ready(server) else "DOWN"))
+    log.info(" | ".join(parts))
+
+
 def gpu(a, log):
     """Model server + 02c (layouts, pushed for the build machines) + 07 captions over shards on the Hub."""
     if not a.push_to_hub:
@@ -350,7 +400,7 @@ def gpu(a, log):
         if not a.dry_run:
             procs["02c"] = subprocess.Popen(with_root(cmd), cwd=HERE, stderr=subprocess.STDOUT,
                                             stdout=open(DATA_ROOT / "logs" / "console_02c_detect_layout.log", "a"))
-    cmd = [PY, "07_caption_shards.py", "--repo-id", a.push_to_hub, "--follow", "--backend", "openai",
+    cmd = [PY, "07_caption_shards.py", "--repo-id", a.push_to_hub, "--follow", "--idle-exit-min", "1440", "--backend", "openai",
            "--api-base", a.vlm_server or "http://localhost:8000/v1", "--model", a.vlm_model, *qc_args(a)]
     log.info("▶ (background) %s", " ".join(with_root(cmd)))
     if a.dry_run:
@@ -361,14 +411,27 @@ def gpu(a, log):
         atexit.register(lambda p=p: p.poll() is None and p.terminate())
     lo = META_FILES["layout_overrides.parquet"]
     last = lo.stat().st_mtime if lo.exists() else 0
+    n_videos = None
+    try:
+        n_videos = pd_read(META_FILES["manifest_2d.parquet"], ["video_id"]).video_id.nunique()
+    except Exception:
+        pass
+    t_start, n0, last_push = time.time(), layout_count(lo), time.time()
+    log.info("Status every %d s (details: tail -f %s/logs/02c_detect_layout.log  and  .../07_caption_shards.log)",
+             a.status_every, DATA_ROOT)
     while any(p.poll() is None for p in procs.values()):
-        time.sleep(600)
-        if lo.exists() and lo.stat().st_mtime > last:  # share new layout checks with the build machines
-            last = lo.stat().st_mtime
+        time.sleep(a.status_every)
+        gpu_status(log, procs, lo, n_videos, n0, t_start, a.vlm_server)
+        if time.time() - last_push >= 600 and lo.exists() and lo.stat().st_mtime > last:
+            last, last_push = lo.stat().st_mtime, time.time()  # share new layout checks with the build machines
             try:
                 hub_push_meta(a.push_to_hub, ["layout_overrides.parquet"], log)
             except Exception as e:
                 log.warning("layout push failed (will retry): %s", e)
+        if "02c" in procs and procs["02c"].poll() is not None and not getattr(procs["02c"], "_reported", False):
+            procs["02c"]._reported = True
+            log.info("02c finished (exit %s): layout file pushed within 10 min; the CPU build can start after that",
+                     procs["02c"].returncode)
     if lo.exists() and lo.stat().st_mtime > last:
         hub_push_meta(a.push_to_hub, ["layout_overrides.parquet"], log)
     for name, p in procs.items():
@@ -530,6 +593,7 @@ def main():
     ap.add_argument("--machine-tag", default=None, help="build: tag in shard names (default m<i> with --machine-shard)")
     ap.add_argument("--video-group-window", type=int, default=200000,
                     help="build: process a video's chunks back to back within windows of N clips (fewer URL resolves)")
+    ap.add_argument("--status-every", type=int, default=120, help="gpu: seconds between status lines")
     ap.add_argument("--idle-cycles", type=int, default=6, help="build: stop after N cycles in a row with nothing new")
     ap.add_argument("--clips", type=int, default=20, help="smoke: clips to process")
     ap.add_argument("--cycle-clips", type=int, default=8000,

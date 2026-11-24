@@ -258,7 +258,7 @@ def main():
             break
         if not args.follow:
             break
-        if time.time() - idle_since > args.idle_exit_min * 60:
+        if n_shards and time.time() - idle_since > args.idle_exit_min * 60:  # never quit before the first shard
             log.info("No new shards for %.0f min: done.", args.idle_exit_min)
             break
         time.sleep(args.poll_min * 60)
