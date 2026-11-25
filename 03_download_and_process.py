@@ -55,9 +55,14 @@ from tqdm import tqdm
 from ng_common import add_data_root_arg, default_cookies, encode_native_actions, DATA_ROOT, ACTION_DIM, ACTION_NAMES, atomic_write_json, free_gb, processed_dir_for, setup_logging
 
 PERMANENT_ERR = re.compile(
-    r"(private video|video unavailable|video is unavailable|does not exist|has been removed|no longer available|account associated|"
-    r"copyright|members-only|join this channel|confirm your age|is not available|terminated|"
+    r"(private video|video unavailable|video is unavailable|this video is not available|does not exist|has been removed|"
+    r"no longer available|account associated|copyright|members-only|join this channel|confirm your age|terminated|"
     r"This live event|premieres in)", re.I)
+# NOT permanent: yt-dlp got no real formats, almost always because YouTube's JS challenge wasn't solved (deno missing /
+# outdated challenge solver / player change) -> only storyboard images -> "Requested format is not available".
+# The video itself is fine. (A generic "is not available" pattern used to mark these videos dead for good.)
+FORMAT_ERR = re.compile(r"(Requested format is not available|Only images are available|n challenge solving failed|"
+                        r"challenge solving failed|Signature extraction failed|nsig extraction failed)", re.I)
 PROXY_ERR = re.compile(r"(Unable to connect to proxy|ProxyError|proxy.*(refused|unreachable)|Connection refused.*8899)", re.I)
 RATE_ERR = re.compile(r"(HTTP Error 429|too many requests|not a bot|sign in to confirm|rate.?limit)", re.I)
 
@@ -117,6 +122,7 @@ class StreamResolver:
         self.glock = threading.Lock()
         self.dead: dict[str, str] = {}
         self.bot_streak = 0  # consecutive bot-check / 429 failures across all workers
+        self.format_streak = 0  # consecutive "no real formats" failures (YouTube JS challenge not solved)
         self.geo_locks: dict[str, threading.Lock] = {}
         self.proxy_streak = 0  # consecutive "cannot connect to proxy" failures
 
@@ -148,7 +154,7 @@ class StreamResolver:
                     info = ydl.extract_info(url, download=False)
             except Exception as e:
                 msg = str(e)
-                if PERMANENT_ERR.search(msg) and not RATE_ERR.search(msg):
+                if PERMANENT_ERR.search(msg) and not RATE_ERR.search(msg) and not FORMAT_ERR.search(msg):
                     self.dead[video_id] = msg[:300]
                     raise PermanentError(msg[:300]) from e
                 if RATE_ERR.search(msg):
@@ -614,6 +620,8 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
                 if RATE_ERR.search(str(e)):
                     limiter.penalize(args.rate_penalty)
                     resolver.bot_streak += 1
+                if FORMAT_ERR.search(str(e)):
+                    resolver.format_streak += 1
                 if PROXY_ERR.search(str(e)):
                     resolver.proxy_streak += 1
                     raise  # no point trying other methods or retrying: the proxy itself is down
@@ -657,6 +665,7 @@ def process_chunk(row, args, resolver: StreamResolver, limiter: RateLimiter, log
         os.replace(work / "meta.json", out_dir / "meta.json")
         src_actions.unlink(missing_ok=True)
         resolver.bot_streak = 0
+        resolver.format_streak = 0
         resolver.proxy_streak = 0
         return {"status": "ok", "method": method_used, "padded": n_out - decoded, "bucket": geo["bucket"]}
     finally:
@@ -676,7 +685,7 @@ def download_section(url: str, fmt: str, t0: float, t1: float, tmp: Path, args) 
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=args.download_timeout)
     if p.returncode != 0:
         msg = (p.stderr or p.stdout)[-600:]
-        if PERMANENT_ERR.search(msg) and not RATE_ERR.search(msg):
+        if PERMANENT_ERR.search(msg) and not RATE_ERR.search(msg) and not FORMAT_ERR.search(msg):
             raise PermanentError(msg)
         raise RuntimeError(f"yt-dlp failed: {msg}")
     files = [f for f in tmp.glob("raw.*") if f.suffix not in (".part", ".ytdl")]
@@ -1041,6 +1050,12 @@ def main():
                           "Stopping; nothing was marked failed, re-run when it's back.", args.proxy, resolver.proxy_streak)
                 stop = True
                 proxy_down = True
+            if not stop and resolver.format_streak >= 20:
+                log.error("yt-dlp gets no video formats from YouTube (%d failures in a row: 'Requested format is not "
+                          "available'). Its JavaScript challenge solving is failing: check `deno --version`, run "
+                          "`pip install -U \"yt-dlp[default]\" bgutil-ytdlp-pot-provider`, and that the PO-token server "
+                          "answers on 127.0.0.1:4416. Stopping; nothing was marked failed.", resolver.format_streak)
+                stop = True
             if not stop and resolver.bot_streak >= args.max_bot_streak:
                 log.error("YouTube is bot-blocking this IP (%d consecutive bot-check/429 failures). Stopping; progress "
                           "is saved. Use --cookies (logged-in, ideally with a PO-token provider plugin) or --proxy, "

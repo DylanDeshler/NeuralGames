@@ -461,7 +461,13 @@ def main():
     if len(done):  # retry transient failures; keep successes and permanent failures
         # "unparsed" is retried too: before ServerDown existed, a crashed model server produced empty answers
         # that were recorded as unparsed (and those videos then skipped the crop fix)
-        final = done["status"].isin(["ok"]) | done["status"].astype(str).str.startswith("permanent")
+        st = done["status"].astype(str)
+        # "permanent" rows caused by missing formats (unsolved YouTube JS challenge) are NOT permanent: retry them
+        fmt = st.str.contains(S3.FORMAT_ERR.pattern, case=False, regex=True)
+        if fmt.any():
+            log.warning("%d videos were marked permanently failed because of missing formats (YouTube JS challenge); "
+                        "re-checking them", int(fmt.sum()))
+        final = done["status"].isin(["ok"]) | (st.str.startswith("permanent") & ~fmt)
         done = done[final]
     todo = [v for v in order if v not in set(done["video_id"])]
     if args.limit:
@@ -591,7 +597,18 @@ def main():
                         pending.add(ex.submit(fetch, nxt))
                 del finished
 
+    fmt_streak, aborted = 0, False
     for r in results():
+        if r[2] and S3.FORMAT_ERR.search(r[2]):
+            fmt_streak += 1
+            if fmt_streak >= 20:  # YouTube JS challenge failing for everything: stop instead of churning
+                log.error("yt-dlp gets no video formats from YouTube (20 videos in a row). JavaScript challenge solving is "
+                          "failing: check `deno --version`, `pip install -U \"yt-dlp[default]\" bgutil-ytdlp-pot-provider`, "
+                          "and the PO-token server on 127.0.0.1:4416. Stopping; these videos will be retried.")
+                aborted = True
+                break
+        elif r[1]:
+            fmt_streak = 0
         ready.append(r)
         stats["ok" if r[1] else "fail"] += 1
         if r[3] in ("direct", "sections"):
@@ -614,6 +631,8 @@ def main():
     log.info("Done: %d videos ok | cropped (stream layout / sub-area): %d | with in-game overlays: %d | "
              "mostly non-gameplay frames: %d | failed: %d", len(ok), ok["game_area"].notna().sum(),
              (ok["overlays"] != "[]").sum(), (ok["frac_gameplay"] < 0.5).sum(), (done["status"] != "ok").sum())
+    if aborted:
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":

@@ -369,7 +369,9 @@ def caption_progress() -> tuple[int, int, str]:
 def gpu_status(log, procs: dict, lo: Path, n_videos, n0: int, t_start: float, server: str | None) -> None:
     n = layout_count(lo)
     parts = []
-    if "02c" in procs:
+    if "02c" in procs and procs["02c"].poll() == 0:
+        parts.append(f"02c DONE ({max(n, 0):,} videos)")
+    elif "02c" in procs:
         if n >= 0 and n_videos:
             rate = (n - n0) / max(1e-6, (time.time() - t_start) / 3600)
             eta = (n_videos - n) / rate if rate > 0 else float("inf")
@@ -379,8 +381,11 @@ def gpu_status(log, procs: dict, lo: Path, n_videos, n0: int, t_start: float, se
         else:
             parts.append(f"02c {max(n, 0):,} videos")
     sh, cl, r = caption_progress()
-    parts.append(f"captions {sh} shards / {cl:,} clips (last {r})"
-                 + ("" if procs["07"].poll() is None else f" [exited {procs['07'].returncode}]"))
+    if procs["07"].poll() is None and sh == 0:
+        parts.append("captions: waiting for shards on the Hub (they come from the CPU build)")
+    else:
+        parts.append(f"captions {sh} shards / {cl:,} clips (last {r})"
+                     + ("" if procs["07"].poll() is None else f" [exited {procs['07'].returncode}]"))
     parts.append("server " + ("up" if server and server_ready(server) else "DOWN"))
     avail = mem_available_gb()
     if avail is not None:
