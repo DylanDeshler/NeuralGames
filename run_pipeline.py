@@ -136,13 +136,17 @@ def start_vlm_server(a, log) -> None:
         return
     (DATA_ROOT / "logs").mkdir(parents=True, exist_ok=True)
     out = open(DATA_ROOT / "logs" / "vllm_server.log", "a")
-    cmd = ["vllm", "serve", a.vlm_model, "--port", str(port), "--max-model-len", "8192",
+    vllm_bin = Path(PY).parent / "vllm"  # same env as this Python: no reliance on PATH after a reboot
+    cmd = [str(vllm_bin) if vllm_bin.exists() else "vllm", "serve", a.vlm_model, "--port", str(port), "--max-model-len", "8192",
            "--limit-mm-per-prompt", json.dumps({"image": max(6, a.qc_frames or 4)}),
            "--gpu-memory-utilization", "0.90", *(["--enforce-eager"] if a.server_eager else [])]
     log.info("▶ starting model server: %s (log: logs/vllm_server.log)", " ".join(cmd))
     if a.dry_run:
         return
+    out.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} starting: {' '.join(cmd)}\n")
+    out.flush()
     proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT)
+    a._vlm_proc = proc
     atexit.register(lambda: proc.poll() is None and proc.terminate())
     t0 = time.time()
     while not server_ready(a.vlm_server):
@@ -419,9 +423,49 @@ def gpu(a, log):
     t_start, n0, last_push = time.time(), layout_count(lo), time.time()
     log.info("Status every %d s (details: tail -f %s/logs/02c_detect_layout.log  and  .../07_caption_shards.log)",
              a.status_every, DATA_ROOT)
-    while any(p.poll() is None for p in procs.values()):
+    launch = {}  # name -> command, for restarts
+    if "02c" in procs:
+        launch["02c"] = (procs["02c"].args, "console_02c_detect_layout.log")
+    launch["07"] = (procs["07"].args, "console_07_caption_shards.log")
+    restarts = {"server": 0, "02c": 0, "07": 0}
+    down_checks = 0
+    while True:
         time.sleep(a.status_every)
         gpu_status(log, procs, lo, n_videos, n0, t_start, a.vlm_server)
+        # watchdog: model server (02c / 07 pause on their own while it is down, nothing gets recorded)
+        if a.start_vlm_server:
+            vp = getattr(a, "_vlm_proc", None)
+            down_checks = 0 if server_ready(a.vlm_server) else down_checks + 1
+            if (vp is not None and vp.poll() is not None) or down_checks >= 3:
+                restarts["server"] += 1
+                log.error("model server is down (exit %s): restarting it (restart #%d; crash log: logs/vllm_server.log)",
+                          vp.poll() if vp else "?", restarts["server"])
+                if vp is not None and vp.poll() is None:
+                    vp.terminate()
+                    try:
+                        vp.wait(60)
+                    except subprocess.TimeoutExpired:
+                        vp.kill()
+                try:
+                    start_vlm_server(a, log)
+                    down_checks = 0
+                except StepFailed as e:
+                    log.error("server restart failed: %s (retrying next check)", e)
+        # watchdog: background stages that died with an error are restarted (both resume from their outputs)
+        for name, (cmd, logname) in launch.items():
+            p = procs.get(name)
+            if p is not None and p.poll() is not None:
+                if p.returncode == 0:  # finished normally (02c: all videos checked; 07: idle limit reached)
+                    continue
+                restarts[name] += 1
+                if restarts[name] > 20:
+                    log.error("%s keeps failing (exit %s); giving up on it. See logs/%s", name, p.returncode, logname)
+                    continue
+                log.error("%s exited with %s: restarting it (#%d). See logs/%s", name, p.returncode, restarts[name], logname)
+                procs[name] = subprocess.Popen(cmd, cwd=HERE, stderr=subprocess.STDOUT,
+                                               stdout=open(DATA_ROOT / "logs" / logname, "a"))
+        if all(procs[n].poll() is not None and (procs[n].returncode == 0 or restarts[n] > 20) for n in launch):
+            break
         if time.time() - last_push >= 600 and lo.exists() and lo.stat().st_mtime > last:
             last, last_push = lo.stat().st_mtime, time.time()  # share new layout checks with the build machines
             try:

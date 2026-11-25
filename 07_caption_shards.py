@@ -236,6 +236,14 @@ def main():
                                  "vlm_screens": scr, "vlm_frac_gameplay": frac_gp, "vlm_game_title": r["game_title"],
                                  "frame0_dark": bool(np.asarray(ims[0]).mean() < 12) if ims else None,
                                  "vlm_qc_frames": len(ims), "parse_ok": r["parse_ok"], "caption_model": args.model})
+            n_ok = sum(r["parse_ok"] for r in rows)
+            if rows and n_ok < 0.5 * len(rows):  # mostly empty/garbled answers: something is wrong, don't record it
+                log.error("%s: only %d/%d answers parsed; not recording, will retry this shard later", rel, n_ok, len(rows))
+                seen.discard(rel)
+                if args.repo_id:
+                    path.unlink(missing_ok=True)
+                time.sleep(60)
+                continue
             out_rel = caption_rel(rel)
             out_path = (work / out_rel) if args.repo_id else (Path(args.local_root) / out_rel)
             out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -334,12 +335,26 @@ def strip_thinking(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
 
 
+class ServerDown(RuntimeError):
+    """The model server is unreachable / erroring: callers must NOT record results, but wait and retry."""
+
+
 def openai_chat_many(client, model: str, convs: list[list[dict]], max_tokens: int, concurrency: int = 32) -> list[str]:
     """Send many chat requests to an OpenAI-compatible server (e.g. `vllm serve`) concurrently; returns texts.
-    Thinking is disabled for Qwen3.x via chat_template_kwargs (vLLM honours it in extra_body)."""
+    Thinking is disabled for Qwen3.x via chat_template_kwargs (vLLM honours it in extra_body).
+
+    A request that keeps failing returns "" (bad input, e.g. too many tokens), EXCEPT when the server itself is
+    down (connection errors / 5xx): then ServerDown is raised, so a crashed or restarting server never turns
+    into thousands of empty answers that get recorded as final."""
     import time as _t
     from concurrent.futures import ThreadPoolExecutor as _TPE
     extra = vllm_chat_kwargs(model) or None
+
+    def server_problem(e: Exception) -> bool:
+        name = type(e).__name__
+        code = getattr(e, "status_code", None)
+        return name in ("APIConnectionError", "APITimeoutError", "ConnectError", "ConnectionError") or \
+            (isinstance(code, int) and code >= 500)
 
     def one(msgs):
         for attempt in range(5):
@@ -347,9 +362,26 @@ def openai_chat_many(client, model: str, convs: list[list[dict]], max_tokens: in
                 r = client.chat.completions.create(model=model, messages=msgs, temperature=0.0, max_tokens=max_tokens,
                                                    extra_body=extra)
                 return r.choices[0].message.content or ""
-            except Exception:
+            except Exception as e:
                 if attempt == 4:
+                    if server_problem(e):
+                        raise ServerDown(f"model server unavailable: {type(e).__name__}: {e}") from e
                     return ""
                 _t.sleep(2 ** attempt)
     with _TPE(concurrency) as ex:
         return list(ex.map(one, convs))
+
+
+def wait_for_server(api_base: str, log, poll_s: int = 30) -> None:
+    """Block until the OpenAI-compatible server answers /models again (the runner restarts a crashed server)."""
+    import urllib.request
+    t0 = time.time()
+    while True:
+        try:
+            with urllib.request.urlopen(api_base.rstrip("/") + "/models", timeout=5) as r:
+                if r.status == 200:
+                    log.info("model server is back after %.0f s", time.time() - t0)
+                    return
+        except Exception:
+            pass
+        time.sleep(poll_s)

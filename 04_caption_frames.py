@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import logging
 import json
 import os
 import re
@@ -38,7 +39,7 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from ng_common import (add_data_root_arg, DATA_ROOT, DEFAULT_VLM, atomic_write_json, atomic_write_parquet, openai_chat_many,
+from ng_common import (ServerDown, wait_for_server, add_data_root_arg, DATA_ROOT, DEFAULT_VLM, atomic_write_json, atomic_write_parquet, openai_chat_many,
                        processed_dir_for, setup_logging, strip_thinking, vllm_chat_kwargs, vllm_mm_kwargs)
 
 DEFAULT_MODEL = DEFAULT_VLM
@@ -186,13 +187,19 @@ class OpenAIBackend:
     def __init__(self, args):
         from openai import OpenAI
         self.client = OpenAI(base_url=args.api_base, api_key=args.api_key or os.environ.get("OPENAI_API_KEY", "EMPTY"))
-        self.model, self.max_new, self.conc = args.model, args.max_new_tokens, args.concurrency
+        self.model, self.max_new, self.conc, self.api_base = args.model, args.max_new_tokens, args.concurrency, args.api_base
 
     def __call__(self, batch):
         convs = [[{"role": "user", "content": [
             *({"type": "image_url", "image_url": {"url": to_data_uri(im)}} for im in ims),
             {"type": "text", "text": prompt_for(len(ims))}]}] for ims in batch]
-        return openai_chat_many(self.client, self.model, convs, self.max_new, self.conc)
+        while True:  # server crash/restart: wait and redo the batch (never return empty captions for it)
+            try:
+                return openai_chat_many(self.client, self.model, convs, self.max_new, self.conc)
+            except ServerDown as e:
+                log = logging.getLogger("caption")
+                log.warning("%s: waiting for it, then retrying this batch", e)
+                wait_for_server(self.api_base, log)
 
 
 # ============================================================================ manifest merge

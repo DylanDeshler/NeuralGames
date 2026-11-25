@@ -22,6 +22,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import logging
 import base64
 import importlib.util
 import io
@@ -39,7 +40,7 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from ng_common import (add_data_root_arg, default_cookies, DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, openai_chat_many, setup_logging, strip_thinking,
+from ng_common import (ServerDown, wait_for_server, add_data_root_arg, default_cookies, DATA_ROOT, DEFAULT_VLM, atomic_write_parquet, openai_chat_many, setup_logging, strip_thinking,
                        vllm_chat_kwargs, vllm_mm_kwargs)
 
 _spec = importlib.util.spec_from_file_location("stage03", Path(__file__).with_name("03_download_and_process.py"))
@@ -211,10 +212,17 @@ class ServerVLM:
     def __init__(self, args):
         from openai import OpenAI
         self.client = OpenAI(base_url=args.api_base, api_key=args.api_key or os.environ.get("OPENAI_API_KEY", "EMPTY"))
-        self.model, self.conc = args.model, args.concurrency
+        self.model, self.conc, self.api_base = args.model, args.concurrency, args.api_base
+        self.log = logging.getLogger("02c_detect_layout")
 
     def chat(self, convs):
-        return openai_chat_many(self.client, self.model, convs, 400, self.conc) if convs else []
+        while convs:  # a crashed/restarting server pauses the batch instead of recording empty answers
+            try:
+                return openai_chat_many(self.client, self.model, convs, 400, self.conc)
+            except ServerDown as e:
+                self.log.warning("%s: waiting for it, then retrying this batch", e)
+                wait_for_server(self.api_base, self.log)
+        return []
 
 
 def calibrate_coords(vlm, log) -> bool:
@@ -451,7 +459,9 @@ def main():
     out_path = Path(args.out)
     done = pd.read_parquet(out_path) if out_path.exists() else pd.DataFrame(columns=["video_id"])
     if len(done):  # retry transient failures; keep successes and permanent failures
-        final = done["status"].isin(["ok", "unparsed"]) | done["status"].astype(str).str.startswith("permanent")
+        # "unparsed" is retried too: before ServerDown existed, a crashed model server produced empty answers
+        # that were recorded as unparsed (and those videos then skipped the crop fix)
+        final = done["status"].isin(["ok"]) | done["status"].astype(str).str.startswith("permanent")
         done = done[final]
     todo = [v for v in order if v not in set(done["video_id"])]
     if args.limit:
