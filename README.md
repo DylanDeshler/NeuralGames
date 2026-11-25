@@ -153,7 +153,8 @@ Stage 05's QC drops happen at load time instead:
 ```python
 import pandas as pd
 cap = pd.read_parquet("hf://datasets/<user>/nitrogen-2d-wm/captions/")   # or a local copy
-cap = cap[(cap.vlm_frac_gameplay >= 0.75) & (cap.vlm_screens.str[0] == "gameplay") & (cap.vlm_is_2d != False)]
+cap = cap[cap.parse_ok & (cap.vlm_frac_gameplay >= 0.75) & (cap.vlm_screens.str[0] == "gameplay")
+          & (cap.vlm_is_2d != False)]
 keep = dict(zip(cap.uuid, cap.caption))          # in the WebDataset pipeline: select(lambda s: s["__key__"] in keep)
 ```
 

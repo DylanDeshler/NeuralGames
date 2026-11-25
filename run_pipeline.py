@@ -382,7 +382,21 @@ def gpu_status(log, procs: dict, lo: Path, n_videos, n0: int, t_start: float, se
     parts.append(f"captions {sh} shards / {cl:,} clips (last {r})"
                  + ("" if procs["07"].poll() is None else f" [exited {procs['07'].returncode}]"))
     parts.append("server " + ("up" if server and server_ready(server) else "DOWN"))
-    log.info(" | ".join(parts))
+    avail = mem_available_gb()
+    if avail is not None:
+        parts.append(f"RAM free {avail:.1f} GB")
+    (log.warning if avail is not None and avail < 3 else log.info)(" | ".join(parts)
+        + ("  <-- LOW MEMORY: the box hangs (no swap) if this reaches 0" if avail is not None and avail < 3 else ""))
+
+
+def mem_available_gb() -> float | None:
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1e6
+    except OSError:
+        return None
+    return None
 
 
 def gpu(a, log):

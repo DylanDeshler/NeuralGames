@@ -32,7 +32,7 @@ import re
 import shutil
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 
 import numpy as np
@@ -521,7 +521,10 @@ def main():
                     owners.append((v, fi, kind, w, h))
         outs = vlm.chat(convs)
         answers: dict[tuple[str, int], dict] = {}
+        empty: dict[str, int] = {}  # video -> number of questions with NO answer at all (request failed)
         for (v, fi, kind, w, h), txt in zip(owners, outs):
+            if not (txt or "").strip():
+                empty[v] = empty.get(v, 0) + 1
             answers.setdefault((v, fi), {})[kind] = (parse_game(txt, w, h) if kind == "game" else
                                                      parse_layout(txt, w, h) if kind == "layout" else parse_screen(txt))
             if kind == "screen":
@@ -534,9 +537,13 @@ def main():
         for v, frames, err, method, secs in got:
             if frames:
                 res = per_vid.get(v, [])
-                row = {"video_id": v, "status": "ok" if res else "unparsed", "fetch_method": method,
-                       "fetch_s": round(secs, 1), **(aggregate(res, args.full_thresh) if res else {})}
-                if res:
+                # a video is "ok" only if EVERY question got an answer: a missing game-box answer would silently
+                # mean "full frame, no crop". Incomplete videos are not used by stage 03 and are re-checked next run.
+                status = "incomplete" if empty.get(v) else ("ok" if res else "unparsed")
+                row = {"video_id": v, "status": status, "fetch_method": method, "fetch_s": round(secs, 1),
+                       "n_empty_answers": int(empty.get(v, 0)), "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                       "vlm_model": args.model, **(aggregate(res, args.full_thresh) if res and status == "ok" else {})}
+                if res and status == "ok":
                     row.update(final_geometry(row, frames, vids[vids.video_id == v]))
                 rows.append(row)
         flush()
@@ -564,24 +571,41 @@ def main():
     stats = {"ok": 0, "fail": 0, "direct": 0, "sections": 0, "secs": 0.0}
     ready = []
     pbar = tqdm(total=len(todo), desc="videos", unit="vid")
-    with ThreadPoolExecutor(args.workers) as ex:
-        futs = [ex.submit(fetch, v) for v in todo]
-        for f in as_completed(futs):
-            r = f.result()
-            ready.append(r)
-            stats["ok" if r[1] else "fail"] += 1
-            if r[3] in ("direct", "sections"):
-                stats[r[3]] += 1
-            stats["secs"] += r[4]
-            n = stats["ok"] + stats["fail"]
-            pbar.update(1)
-            pbar.set_postfix(ok=stats["ok"], fail=stats["fail"], direct=stats["direct"], sections=stats["sections"],
-                             s_per_vid=f"{stats['secs'] / n:.0f}")
-            if n <= 3 or (r[2] and stats["fail"] <= 5):
-                log.info("%s: %d frames via %s in %.0fs %s", r[0], len(r[1]), r[3], r[4], r[2] or "")
-            if len(ready) >= args.batch_size:
-                run_vlm(ready)
-                ready = []
+    # Bounded in-flight work: at most ~2x workers fetches pending, and each finished future is dropped right after
+    # use. (Submitting every video up front kept ALL finished futures - and their ~34 MB of probe frames each -
+    # alive for the whole run: ~34 GB per 1,000 videos, which froze the GPU box when RAM ran out.)
+    def results():
+        it = iter(todo)
+        pending = set()
+        with ThreadPoolExecutor(args.workers) as ex:
+            for v in it:
+                pending.add(ex.submit(fetch, v))
+                if len(pending) >= 2 * args.workers:
+                    break
+            while pending:
+                finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for f in finished:
+                    yield f.result()
+                    nxt = next(it, None)
+                    if nxt is not None:
+                        pending.add(ex.submit(fetch, nxt))
+                del finished
+
+    for r in results():
+        ready.append(r)
+        stats["ok" if r[1] else "fail"] += 1
+        if r[3] in ("direct", "sections"):
+            stats[r[3]] += 1
+        stats["secs"] += r[4]
+        n = stats["ok"] + stats["fail"]
+        pbar.update(1)
+        pbar.set_postfix(ok=stats["ok"], fail=stats["fail"], direct=stats["direct"], sections=stats["sections"],
+                         s_per_vid=f"{stats['secs'] / n:.0f}")
+        if n <= 3 or (r[2] and stats["fail"] <= 5):
+            log.info("%s: %d frames via %s in %.0fs %s", r[0], len(r[1]), r[3], r[4], r[2] or "")
+        if len(ready) >= args.batch_size:
+            run_vlm(ready)
+            ready = []
     if ready:
         run_vlm(ready)
     pbar.close()

@@ -784,8 +784,8 @@ def apply_layout_overrides(man: pd.DataFrame, args, log) -> pd.DataFrame:
         return json.dumps(cur + extra)
     man.loc[with_ov, "bbox_others"] = [merge_others(o, v) for o, v in zip(man.loc[with_ov, "bbox_others"], vid[with_ov])]
     keep = pd.Series(True, index=man.index)
-    if args.require_layout_check:  # 02c now checks every video (it also refines metadata boxes)
-        keep &= vid.isin(lo.set_index("video_id").index)
+    if args.require_layout_check:  # only videos 02c checked SUCCESSFULLY (not failed / incomplete / unparsed ones)
+        keep &= vid.isin(ok.index)
     if args.min_video_gameplay_frac > 0:
         keep &= ~vid.map(ok["frac_gameplay"]).fillna(1.0).lt(args.min_video_gameplay_frac)
     if args.max_video_3d_frac < 1 and "frac_3d" in ok.columns:  # older 02c rows have no answer: kept, 05 filters per clip
